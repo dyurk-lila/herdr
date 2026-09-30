@@ -29,6 +29,8 @@ mod notifications;
 mod overlay_input;
 mod prediction;
 mod prediction_input;
+pub(crate) mod prediction_profiles;
+pub(crate) mod prediction_words;
 mod preferences;
 mod render;
 mod scroll;

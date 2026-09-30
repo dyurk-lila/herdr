@@ -31,6 +31,7 @@ mod image_files;
 mod input;
 mod loop_config;
 mod notifications;
+mod prediction_store;
 mod shell;
 mod shell_runtime;
 mod startup;
@@ -502,6 +503,28 @@ async fn run_client_loop(
         }
     }
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
+    let mut prediction_store = None;
+    if let Some(shell) = state
+        .shell
+        .as_mut()
+        .filter(|shell| shell.prediction_enabled())
+    {
+        if is_remote_client {
+            if let Ok(target) = std::env::var(crate::remote::REMOTE_PREDICTION_TARGET_ENV_VAR) {
+                if crate::remote::validate_remote_target(&target).is_ok() {
+                    shell.set_primary_prediction_target(&target);
+                }
+            }
+        }
+        let path = crate::config::state_dir().join("client/prediction-profiles/profiles.json");
+        match prediction_store::ProfileStore::start(path) {
+            Ok((profiles, store)) => {
+                shell.initialize_prediction_profiles(profiles);
+                prediction_store = Some(store);
+            }
+            Err(error) => tracing::debug!(%error, "editor learning persistence is unavailable"),
+        }
+    }
     // Cell size reported by the host terminal, packed as width<<32 | height.
     // Zero means the host has not reported one.
     let reported_cell_size = Arc::new(AtomicU64::new(0));
@@ -670,6 +693,18 @@ async fn run_client_loop(
     #[cfg(windows)]
     let mut stdin_open = true;
     while !should_quit.load(Ordering::Acquire) {
+        if let (Some(shell), Some(store)) = (state.shell.as_mut(), prediction_store.as_mut()) {
+            for update in shell.take_prediction_profile_updates() {
+                let resume_epoch = update.epoch().saturating_add(1);
+                if !store.enqueue(update) {
+                    state.repaint_pending |=
+                        shell.pause_prediction_profiles_until_epoch(resume_epoch);
+                }
+            }
+            if let Some(profiles) = store.take_latest() {
+                state.repaint_pending |= shell.initialize_prediction_profiles(profiles);
+            }
+        }
         if pending_activation.is_none() {
             if let Some(reload) = pending_catalog.take() {
                 match reload {

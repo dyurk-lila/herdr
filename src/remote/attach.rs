@@ -74,6 +74,7 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         require_surface_interest,
     )?;
 
+    let prediction_target = remote.target.clone();
     let _bridge = SshStdioBridge::start(
         remote.target,
         prepared_remote.remote_herdr,
@@ -83,7 +84,12 @@ pub(crate) fn run_remote(remote: RemoteLaunch) -> io::Result<()> {
         false,
     )?;
 
-    run_client_process(&local_socket, &reattach_command, remote.keybindings)
+    run_client_process(
+        &local_socket,
+        &reattach_command,
+        remote.keybindings,
+        &prediction_target,
+    )
 }
 
 pub(crate) fn check_saved_ssh(target: &str, session: &str) -> io::Result<()> {
@@ -3369,6 +3375,7 @@ fn run_client_process(
     local_socket: &Path,
     reattach_command: &str,
     keybindings: RemoteKeybindings,
+    prediction_target: &str,
 ) -> io::Result<()> {
     let exe = std::env::current_exe()?;
     let status = Command::new(exe)
@@ -3379,6 +3386,7 @@ fn run_client_process(
         )
         .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
         .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
+        .env(super::REMOTE_PREDICTION_TARGET_ENV_VAR, prediction_target)
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR)
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())

@@ -32,13 +32,94 @@ fn remote_shell(enabled: bool, remote: bool) -> ClientShellState {
 
 fn echo(state: &mut ClientShellState, text: &str) {
     let mut next = state.pane_surface.clone().expect("authoritative surface");
+    for cell in &mut next.frame.cells[..usize::from(next.frame.width)] {
+        cell.symbol = " ".into();
+    }
     for (x, c) in text.chars().enumerate() {
         next.frame.cells[x].symbol = c.to_string();
     }
-    next.frame.cursor.as_mut().expect("cursor").x = text.len() as u16;
+    next.frame.cursor.as_mut().expect("cursor").x = text.chars().count() as u16;
     next.surface_revision += 1;
     next.panes[0].content_revision += 1;
     state.set_pane_surface(next);
+}
+
+#[test]
+fn remote_backspace_is_predicted_and_forwarded_once_while_typing_echo_is_in_flight() {
+    let mut state = remote_shell(true, true);
+    state.handle_input_bytes(b"a");
+    echo(&mut state, "a");
+    state.handle_input_bytes(b"bc");
+    assert_eq!(visible_prefix(&mut state, 4), "abc ");
+    let deletion = state.handle_input_bytes(b"\x7f");
+    assert_eq!(deletion.requests.len(), 1);
+    assert!(deletion.repaint);
+    assert_eq!(visible_prefix(&mut state, 4), "ab  ");
+    assert_eq!(
+        state.pane_surface.as_ref().unwrap().frame.cells[1].symbol,
+        " "
+    );
+    echo(&mut state, "abc");
+    assert_eq!(visible_prefix(&mut state, 4), "ab  ");
+    echo(&mut state, "ab");
+    assert!(!state.input_prediction.has_pending());
+    state.handle_input_bytes(b"d");
+    assert_eq!(visible_prefix(&mut state, 4), "abd ");
+}
+
+#[test]
+fn routed_enter_reuses_a_matching_empty_agent_prompt_without_a_new_character_round_trip() {
+    assert_routed_enter_reuses_prompt(crate::api::schema::AgentStatus::Idle);
+}
+
+#[test]
+fn agent_activity_status_is_advisory_for_an_exact_learned_live_prompt() {
+    use crate::api::schema::AgentStatus;
+    for status in [
+        AgentStatus::Unknown,
+        AgentStatus::Blocked,
+        AgentStatus::Working,
+        AgentStatus::Done,
+    ] {
+        assert_routed_enter_reuses_prompt(status);
+    }
+}
+
+fn assert_routed_enter_reuses_prompt(status: crate::api::schema::AgentStatus) {
+    let mut state = remote_shell(true, true);
+    let mut projection = snapshot();
+    projection.agents.push(crate::protocol::ClientShellAgent {
+        pane_id: "pane_1".into(),
+        workspace_id: "workspace_1".into(),
+        tab_id: "tab_1".into(),
+        name: None,
+        display_agent: Some("Codex".into()),
+        agent: Some(crate::detect::agent_label(crate::detect::Agent::Codex).into()),
+        title: None,
+        terminal_title: None,
+        terminal_title_stripped: None,
+        agent_status: status,
+        state_change_seq: 1,
+        state_labels: vec![],
+        tokens: vec![],
+        focused: true,
+    });
+    state.set_snapshot(Box::new(projection));
+    echo(&mut state, "› ");
+    state.handle_input_bytes(b"a");
+    echo(&mut state, "› a");
+    let enter = state.handle_input_bytes(b"\r");
+    assert_eq!(enter.requests.len(), 1, "Enter is forwarded once");
+    echo(&mut state, "› ");
+    let typed = state.handle_input_bytes(b"b");
+    assert_eq!(typed.requests.len(), 1);
+    assert!(typed.repaint);
+    assert_eq!(visible_prefix(&mut state, 4), "› b ");
+    assert_eq!(
+        state.pane_surface.as_ref().unwrap().frame.cells[2].symbol,
+        " ",
+        "server draft remains authoritative"
+    );
 }
 
 fn visible_prefix(state: &mut ClientShellState, count: usize) -> String {
@@ -240,6 +321,10 @@ fn remote_prediction_applies_to_saved_ssh_machines_and_clears_on_switch() {
     echo(&mut state, "a");
     state.handle_input_bytes(b"b");
     assert_eq!(visible_prefix(&mut state, 2), "ab");
+
+    let deletion = state.handle_input_bytes(b"\x7f");
+    assert_eq!(deletion.requests.len(), 1);
+    assert_eq!(visible_prefix(&mut state, 2), "a ");
 
     assert!(state.activate_endpoint_projection(&ClientEndpointId::Local));
     assert!(!state.input_prediction.has_pending());
