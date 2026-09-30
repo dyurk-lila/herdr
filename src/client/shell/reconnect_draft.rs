@@ -79,6 +79,15 @@ impl DraftAnchor {
                 .zip(&current.row)
                 .filter(|(a, b)| a.hyperlink != b.hyperlink)
                 .count(),
+            outside_input_changes = self
+                .row
+                .iter()
+                .zip(&current.row)
+                .enumerate()
+                .filter(|(index, (a, b))| {
+                    !(self.input_start..=self.input_end).contains(index) && a != b
+                })
+                .count(),
             "reconnect recovery held"
         );
     }
@@ -449,6 +458,7 @@ impl ReconnectDrafts {
                 return true;
             }
             // Intermediate echoes are possible. No mismatch can authorize a retry.
+            pending.expected.trace_mismatch(current, "echo");
             return false;
         }
         if draft.allow_auto && draft.anchor.as_ref() != Some(current) {

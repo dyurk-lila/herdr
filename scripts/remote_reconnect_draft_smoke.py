@@ -9,6 +9,7 @@ are discarded; artifacts remain private and include target/path metadata.
 """
 
 import argparse
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import asdict, dataclass
 from enum import StrEnum
 import json
@@ -21,6 +22,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+from threading import Event
 import time
 import uuid
 
@@ -58,6 +60,7 @@ MISMATCH_BOOL_FIELDS = (
 )
 MISMATCH_COUNT_FIELDS = (
     "symbol_changes", "style_changes", "skip_changes", "hyperlink_changes",
+    "outside_input_changes",
 )
 LOG_FIELD = re.compile(r'(?<!\S)([a-z_]+)=(?:"([^"]*)"|([^\s]+))(?=\s|$)')
 
@@ -76,6 +79,7 @@ class BridgePhase(StrEnum):
 class MismatchPhase(StrEnum):
     ATTEMPT = "attempt"
     OBSERVE = "observe"
+    ECHO = "echo"
 
 
 class RestoreFailure(RuntimeError):
@@ -107,7 +111,7 @@ def parse_reconnect_diagnostics(lines):
             if any(name not in fields for name in required):
                 result["malformed_records"] += 1
                 continue
-            if fields["phase"] not in (MismatchPhase.ATTEMPT, MismatchPhase.OBSERVE) or any(fields[name] not in ("true", "false") for name in MISMATCH_BOOL_FIELDS) or any(re.fullmatch(r"[0-9]+", fields[name]) is None for name in MISMATCH_COUNT_FIELDS):
+            if fields["phase"] not in tuple(MismatchPhase) or any(fields[name] not in ("true", "false") for name in MISMATCH_BOOL_FIELDS) or any(re.fullmatch(r"[0-9]+", fields[name]) is None for name in MISMATCH_COUNT_FIELDS):
                 result["malformed_records"] += 1
                 continue
             record = {"phase": fields["phase"]}
@@ -116,9 +120,9 @@ def parse_reconnect_diagnostics(lines):
         else:
             continue
         if len(result["context_mismatches"]) >= MAX_DIAGNOSTIC_RECORDS:
+            result["context_mismatches"].pop(0)
             result["omitted_records"] += 1
-        else:
-            result["context_mismatches"].append(record)
+        result["context_mismatches"].append(record)
     return result
 
 
@@ -238,8 +242,8 @@ def ssh_text(target, command):
     return result.stdout
 
 
-def authoritative(remote, session, pane):
-    return remote.cli("--session", session, "pane", "read", pane, "--source", "visible", "--format", "text")
+def authoritative(remote, session, pane, *, timeout=45):
+    return remote.cli("--session", session, "pane", "read", pane, "--source", "visible", "--format", "text", timeout=timeout)
 
 
 def require_authoritative(remote, session, pane, expected, agent):
@@ -249,31 +253,47 @@ def require_authoritative(remote, session, pane, expected, agent):
     return {"generated_draft": expected, "exact_row_count": len(rows)}
 
 
+def read_authoritative_while_pumping(worker, client, remote, session, pane, deadline):
+    started = time.monotonic()
+    # Remote retries only a failed pre-authentication banner, at most once.
+    timeout = max(.01, (deadline - started) / 2)
+    result = worker.submit(authoritative, remote, session, pane, timeout=timeout)
+    while not result.done():
+        client.pump(.1)
+    source = result.result()
+    return source, (time.monotonic() - started) * 1000
+
+
 def wait_restored(client, remote, session, pane, expected, agent, *, cursor_at_end=True):
     deadline = time.monotonic() + 45
-    while True:
-        client.pump(.1)
-        source = authoritative(remote, session, pane)
-        rows = draft_rows(source, expected, agent=agent)
-        client.pump(0)
-        local_rows = draft_rows(client.screen.text(), expected, composed=True, agent=agent)
-        cursor_matches = not cursor_at_end or exact_draft_cursor(client.screen, expected, len(expected))
-        if len(rows) == 1 and len(local_rows) == 1 and cursor_matches:
-            return {"generated_draft": expected, "exact_row_count": 1, "local": client.screen.evidence(expected)}
-        if time.monotonic() >= deadline:
-            candidates = (BASE_DRAFT, BASE_DRAFT + BURST_SUFFIX, BASE_DRAFT + BURST_SUFFIX + SECOND_SUFFIX, CHANGED_DRAFT, expected)
-            raise RestoreFailure({
-                "expected_draft": expected,
-                "expected_authoritative_row_count": len(rows),
-                "expected_local_row_count": len(local_rows),
-                "local_cursor_matches": cursor_matches,
-                "authoritative_generated_matches": {
-                    draft: len(draft_rows(source, draft, agent=agent))
-                    for draft in dict.fromkeys(candidates)
-                },
-                "local_cursor": client.screen.evidence()["outer_cursor"],
-                "panel": panel_state(client, BURST_SUFFIX),
-            })
+    max_control_read_ms = 0
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        while True:
+            client.pump(.1)
+            source, read_ms = read_authoritative_while_pumping(worker, client, remote, session, pane, deadline)
+            max_control_read_ms = max(max_control_read_ms, read_ms)
+            rows = draft_rows(source, expected, agent=agent)
+            client.pump(0)
+            local_rows = draft_rows(client.screen.text(), expected, composed=True, agent=agent)
+            cursor_matches = not cursor_at_end or exact_draft_cursor(client.screen, expected, len(expected))
+            timed_out = time.monotonic() >= deadline
+            if not timed_out and len(rows) == 1 and len(local_rows) == 1 and cursor_matches:
+                return {"generated_draft": expected, "exact_row_count": 1, "local": client.screen.evidence(expected), "max_control_read_ms": round(max_control_read_ms, 2)}
+            if timed_out:
+                candidates = (BASE_DRAFT, BASE_DRAFT + BURST_SUFFIX, BASE_DRAFT + BURST_SUFFIX + SECOND_SUFFIX, CHANGED_DRAFT, expected)
+                raise RestoreFailure({
+                    "expected_draft": expected,
+                    "expected_authoritative_row_count": len(rows),
+                    "expected_local_row_count": len(local_rows),
+                    "local_cursor_matches": cursor_matches,
+                    "authoritative_generated_matches": {
+                        draft: len(draft_rows(source, draft, agent=agent))
+                        for draft in dict.fromkeys(candidates)
+                    },
+                    "local_cursor": client.screen.evidence()["outer_cursor"],
+                    "panel": panel_state(client, BURST_SUFFIX),
+                    "max_control_read_ms": round(max_control_read_ms, 2),
+                })
 
 
 def panel_state(client, suffix):
@@ -429,6 +449,27 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
 
 
 def self_test():
+    read_ready = Event()
+
+    class PumpProbe:
+        def __init__(self):
+            self.calls = 0
+
+        def pump(self, timeout):
+            self.calls += 1
+            if self.calls >= 2:
+                read_ready.set()
+
+    class ReadProbe:
+        def cli(self, *args, timeout):
+            if not read_ready.wait(5):
+                raise RuntimeError("PTY drain probe did not release the blocked read")
+            return BASE_DRAFT
+
+    client = PumpProbe()
+    with ThreadPoolExecutor(max_workers=1) as worker:
+        source, _ = read_authoritative_while_pumping(worker, client, ReadProbe(), "generated", "own-pane", time.monotonic() + 5)
+    assert source == BASE_DRAFT and client.calls >= 2
     mismatch = 'event="reconnect.context_mismatch" phase="observe" ' + " ".join(f"{name}=false" for name in MISMATCH_BOOL_FIELDS) + " " + " ".join(f"{name}=0" for name in MISMATCH_COUNT_FIELDS)
     parsed = parse_reconnect_diagnostics((
         'unrelated secret="never-retain"',
@@ -440,8 +481,10 @@ def self_test():
     assert set(parsed["context_mismatches"][0]) == {"phase", *MISMATCH_BOOL_FIELDS, *MISMATCH_COUNT_FIELDS}
     assert parsed["echo_timeouts"] == 1
     assert parsed["malformed_records"] == 1 and "never-retain" not in json.dumps(parsed)
-    bounded = parse_reconnect_diagnostics((mismatch for _ in range(MAX_DIAGNOSTIC_RECORDS + 1)))
+    bounded = parse_reconnect_diagnostics((mismatch.replace("symbol_changes=0", f"symbol_changes={index}") for index in range(MAX_DIAGNOSTIC_RECORDS + 1)))
     assert len(bounded["context_mismatches"]) == MAX_DIAGNOSTIC_RECORDS and bounded["omitted_records"] == 1
+    assert bounded["context_mismatches"][0]["symbol_changes"] == 1
+    assert bounded["context_mismatches"][-1]["symbol_changes"] == MAX_DIAGNOSTIC_RECORDS
     with tempfile.TemporaryDirectory(prefix="herdr-rdraft-selftest-", dir="/tmp") as tmp:
         root = Path(tmp)
         log = root / "config/herdr-proto/sessions/generated/herdr-client.log"
@@ -476,7 +519,7 @@ def self_test():
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=5)
-    print("owned bridge gate, control bypass, foreign-session refusal, release, and bounded structural-only diagnostics assertions passed")
+    print("owned bridge gate, control bypass, foreign-session refusal, release, continuous PTY draining, and bounded structural-only diagnostics assertions passed")
 
 
 def main():
