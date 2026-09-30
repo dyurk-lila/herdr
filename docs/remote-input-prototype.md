@@ -71,7 +71,9 @@ architecture, integration and documentation checks. Real Claude 2.1.285 editing
 probes measured median Backspace latency of 219 ms without prediction and 0.63 ms
 with prediction. Left/Right, End, insertion, Unicode and learned word deletion
 were around 1 ms, while Delete measured 4.4 ms. Exact authoritative drafts and a
-rapid mixed-edit burst passed; no model prompts were submitted.
+rapid mixed-edit burst passed. Codex 0.159.2 measured Backspace 246 → 0.65 ms
+and learned same-row clicks 241 → 0.39 ms; all measured edit comparisons and exact
+UTF-8 burst integrity passed. No model prompts were submitted.
 
 Prediction temporarily requires full composition: 0.288 ms per update at 120×48
 with one populated pane and 0.332 ms with 15 panes (1.15×). These are local

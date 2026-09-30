@@ -40,6 +40,34 @@ BACKSPACE_MEDIAN_KEY = "median_backspace_ms"
 EDITING_MEDIANS_KEY = "editing_medians_ms"
 TEST_AGENTS = ("claude", "codex", "pi", "opencode")
 AGENT_STATES = ("idle", "working", "blocked", "done", "unknown")
+EDITOR_STABLE_SECONDS = 6.0
+TRUST_DIALOG_PHRASES = ("do you trust", "trust this folder", "trust the files", "trust the contents", "is this a project you created")
+LOGIN_METHOD_PHRASES = ("select login method", "sign in with chatgpt", "claude account", "login method")
+FOREGROUND_FALLBACK_LABEL = "Run without daemon this time"
+
+
+class StableEditorReadiness:
+    def __init__(self):
+        self.since = None
+
+    def observe(self, ready, now):
+        if not ready:
+            self.since = None
+            return False
+        if self.since is None:
+            self.since = now
+        return now - self.since >= EDITOR_STABLE_SECONDS
+
+
+def foreground_fallback_key(screen):
+    selected = [line for line in screen.splitlines() if line.lstrip().startswith(("›", "❯"))]
+    if len(selected) != 1:
+        return None
+    if "Cancel" in selected[0]:
+        return "up"
+    if FOREGROUND_FALLBACK_LABEL in selected[0]:
+        return "enter"
+    return None
 
 
 class EditOperation(StrEnum):
@@ -199,6 +227,17 @@ def self_test():
     assert not own_pane_agent_metadata(entries, "w1:p1", "claude")["pane_present"]
     entries[0].update(agent="private token", agent_status="private title")
     assert own_pane_agent_metadata(entries, "w9:p1", "claude") == {"agent": None, "agent_status": "unknown", "matches_requested": False, "pane_present": True}
+    readiness = StableEditorReadiness()
+    assert not readiness.observe(True, 0)
+    assert not readiness.observe(True, 5.9)
+    assert not readiness.observe(False, 6)  # A late startup modal resets readiness.
+    assert not readiness.observe(True, 7)
+    assert not readiness.observe(True, 12.9)
+    assert readiness.observe(True, 13)
+    assert foreground_fallback_key("  1. Run without daemon this time\n› 2. Cancel") == "up"
+    assert foreground_fallback_key("› 1. Run without daemon this time\n  2. Cancel") == "enter"
+    assert foreground_fallback_key("  1. Run without daemon this time\n  2. Cancel") is None
+    assert foreground_fallback_key("  1. Run without daemon this time\n› 3. Other") is None
     assert local_editor_ready("OpenAI Codex\n› Write a message\n100% context left", "codex")
     assert local_editor_ready("Claude Code\n❯\nplan mode", "claude")
     assert not local_editor_ready("Connecting to remote machine", "codex")
@@ -267,20 +306,25 @@ def wait_for_agent(client, remote, session, pane, agent, workdir, timeout=180):
     deadline = time.monotonic() + timeout
     trust_accepted = False
     last_state = "agent startup"
+    readiness = StableEditorReadiness()
     while time.monotonic() < deadline:
         client.pump(0.1)
         screen = remote.cli("--session", session, "pane", "read", pane, "--source", "visible", "--format", "text")
+        client.pump(0)
         lower = screen.lower()
-        trust_dialog = any(phrase in lower for phrase in ("do you trust", "trust this folder", "trust the files", "trust the contents", "is this a project you created"))
-        if agent == "codex" and any(phrase in lower for phrase in ("cannot use background server", "cannot use the background server")) and "Run without daemon this time" in screen:
+        trust_dialog = any(phrase in lower for phrase in TRUST_DIALOG_PHRASES)
+        if agent == "codex" and any(phrase in lower for phrase in ("cannot use background server", "cannot use the background server")) and FOREGROUND_FALLBACK_LABEL in screen:
+            readiness.observe(False, time.monotonic())
             # Preserve requested sandbox/approval settings while declining an unavailable daemon.
-            if any(line.lstrip().startswith(("›", "❯")) and "Cancel" in line for line in screen.splitlines()):
-                remote.cli("--session", session, "pane", "send-keys", pane, "up")
+            key = foreground_fallback_key(screen)
+            if key is not None:
+                remote.cli("--session", session, "pane", "send-keys", pane, key)
+                last_state = "one-time foreground compatibility fallback"
             else:
-                remote.cli("--session", session, "pane", "send-keys", pane, "enter")
-            last_state = "one-time foreground compatibility fallback"
+                last_state = "waiting for recognized foreground compatibility selection"
             continue
         if agent == "claude" and "set auto mode as my default permission mode" in lower and "No, keep plan mode" in screen:
+            readiness.observe(False, time.monotonic())
             if "❯ Yes, set auto mode" in screen:
                 remote.cli("--session", session, "pane", "send-keys", pane, "down")
             elif "❯ No, keep plan mode" in screen:
@@ -288,6 +332,7 @@ def wait_for_agent(client, remote, session, pane, agent, workdir, timeout=180):
             last_state = "declining automatic permission mode"
             continue
         if trust_dialog and not trust_accepted and workdir in screen:
+            readiness.observe(False, time.monotonic())
             # Only the empty workspace created by this invocation is approved.
             if agent == "claude":
                 if "❯ Yes, I trust this folder" in screen:
@@ -304,20 +349,33 @@ def wait_for_agent(client, remote, session, pane, agent, workdir, timeout=180):
                 last_state = "generated temporary directory trust accepted"
             continue
         if trust_dialog:
+            readiness.observe(False, time.monotonic())
             last_state = "waiting for generated directory trust dialog to close"
             continue
-        if "sign in" in lower and any(phrase in lower for phrase in ("select login method", "sign in with chatgpt", "claude account", "login method")):
+        if "sign in" in lower and any(phrase in lower for phrase in LOGIN_METHOD_PHRASES):
+            readiness.observe(False, time.monotonic())
             raise RuntimeError(f"{agent} requires authentication before its input editor is available")
+        remote_ready = False
+        editor_geometry = None
         if agent == "claude" and ("claude code" in lower or "opus" in lower or "sonnet" in lower) and "❯" in screen and any(marker in lower for marker in ("for shortcuts", "plan mode", "bypass permissions", "shift+tab")):
-            return {"startup_state": last_state, "trusted_generated_directory": trust_accepted}
-        if agent == "codex" and "openai codex" in lower and "›" in screen and ("for shortcuts" in lower or "context left" in lower):
-            return {"startup_state": last_state, "trusted_generated_directory": trust_accepted}
-        if agent == "opencode" and "Ask anything..." in screen and "tab agents" in lower and "ctrl+p commands" in lower:
-            return {"startup_state": last_state, "trusted_generated_directory": trust_accepted}
-        if agent == "pi" and workdir in screen:
+            remote_ready = True
+        elif agent == "codex" and "openai codex" in lower and "›" in screen and ("for shortcuts" in lower or "context left" in lower):
+            remote_ready = True
+        elif agent == "opencode" and "Ask anything..." in screen and "tab agents" in lower and "ctrl+p commands" in lower:
+            remote_ready = True
+        elif agent == "pi" and workdir in screen:
             editor_rows = pi_editor_rows(screen, workdir)
             if len(editor_rows) == 1:
-                return {"startup_state": last_state, "trusted_generated_directory": trust_accepted, "editor_geometry": {"authoritative_row": editor_rows[0], "input_column": 0, "layout": "plain body between adjacent horizontal rules"}}
+                remote_ready = True
+                editor_geometry = {"authoritative_row": editor_rows[0], "input_column": 0, "layout": "plain body between adjacent horizontal rules"}
+        local_screen = client.screen.text()
+        local_lower = local_screen.lower()
+        local_modal = FOREGROUND_FALLBACK_LABEL in local_screen or any(phrase in local_lower for phrase in TRUST_DIALOG_PHRASES) or "set auto mode as my default permission mode" in local_lower or ("sign in" in local_lower and any(phrase in local_lower for phrase in LOGIN_METHOD_PHRASES))
+        if readiness.observe(remote_ready and local_editor_ready(local_screen, agent) and not local_modal, time.monotonic()):
+            result = {"startup_state": last_state, "trusted_generated_directory": trust_accepted, "editor_stable_seconds": EDITOR_STABLE_SECONDS}
+            if editor_geometry is not None:
+                result["editor_geometry"] = editor_geometry
+            return result
         if "update" in lower and "skip for now" in lower:
             last_state = "agent update prompt requires skipping"
     # Save only recognizable state labels, not arbitrary startup/account text.
