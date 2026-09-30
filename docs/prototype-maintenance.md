@@ -60,6 +60,9 @@ HERDR_BUILD_CHANNEL=proto HERDR_BUILD_ID="$(git rev-parse --short=12 HEAD)" \
 install -m 755 target/release/herdr ~/.local/bin/herdr-proto
 ```
 
-Keep the prototype's config, state and remote test sessions isolated when
-validating it. `[remote].predict_input = true` enables prediction; it remains
-opt-in and does not add offline input replay.
+The `proto` release channel selects separate `herdr-proto` config, state,
+machine-catalog and local socket directories. Verify that `herdr-proto machine
+list --json` and `herdr machine list --json` remain separate after each upstream
+merge. Keep remote test sessions distinct too; local isolation does not split
+a shared remote session. `[remote].predict_input = true` enables prediction;
+it remains opt-in and does not add offline input replay.

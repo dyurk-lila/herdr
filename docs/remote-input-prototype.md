@@ -15,18 +15,40 @@ HERDR_BUILD_CHANNEL=proto HERDR_BUILD_ID=remote-input just build
 install -m 755 target/release/herdr "$HOME/.local/bin/herdr-proto"
 ```
 
-Enable this opt-in setting in the client's configuration:
+Release builds with `HERDR_BUILD_CHANNEL=proto` use the `herdr-proto` application
+directory for configuration, machine profiles, local sessions and sockets.
+On macOS/Linux the config is `~/.config/herdr-proto/config.toml` and machine
+profiles live under `~/.local/state/herdr-proto/`. Normal XDG root overrides still
+work; changing XDG roots is unnecessary and can affect SSH ProxyCommand helpers.
+Stable/preview release builds retain `herdr`; debug builds retain `herdr-dev`.
+
+Enable this opt-in setting in the prototype client's configuration:
 
 ```toml
 [remote]
 predict_input = true
 ```
 
-Connect with `herdr-proto --remote YOUR_SSH_ALIAS --session YOUR_SESSION`. For side-by-side use with stable Herdr, provide a separate `HERDR_CONFIG_PATH` and separate `XDG_CONFIG_HOME`/`XDG_STATE_HOME`. SSH ProxyCommand helpers may also use XDG configuration; expose their existing configuration in the isolated config directory as needed.
+Connect with `herdr-proto --remote YOUR_SSH_ALIAS --session YOUR_SESSION`, or save
+a machine and launch the client:
+
+```sh
+herdr-proto machine add YOUR_SSH_ALIAS --label test --remote-session YOUR_SESSION
+herdr-proto
+```
+
+The normal Herdr machine catalog is separate. Use a dedicated remote session as
+well: multiple clients attaching to the same remote session still share its
+panes, focus and geometry.
+
+Explicit `HERDR_CONFIG_PATH`, `HERDR_SOCKET_PATH` and `HERDR_CLIENT_SOCKET_PATH`
+overrides remain supported. From inside another Herdr pane, clear inherited
+overrides before running prototype CLI commands. Launch the interactive client
+from an outer terminal unless nested Herdr is intentionally enabled.
 
 ## Validation and limits
 
-The native macOS prototype passed 3,730 tests, formatting/Clippy and maintenance, architecture, integration and documentation checks. In a measured remote session, median synthetic visible latency fell from about 225 ms to 0.33 ms, while authoritative acknowledgement remained about 223 ms. Claude's real editor improved from about 222 ms to 1.27 ms. Generated drafts matched the authoritative pane and no model prompts were submitted. A rapid-typing check with five simultaneously unacknowledged characters preserved all input exactly.
+The native macOS prototype passed 3,731 tests, formatting/Clippy and maintenance, architecture, integration and documentation checks. In a measured remote session, median synthetic visible latency fell from about 225 ms to 0.33 ms, while authoritative acknowledgement remained about 223 ms. Claude's real editor improved from about 222 ms to 1.27 ms. Generated drafts matched the authoritative pane and no model prompts were submitted. A rapid-typing check with five simultaneously unacknowledged characters preserved all input exactly.
 
 Live edge checks cover Backspace, bracketed paste, Unicode fallback, resize, Ctrl-U and a non-echoing prompt. Prediction temporarily requires full composition: about 0.29 ms per update at 120×48, with similar cost for one and 15 populated panes. These are local measurements, not platform-wide guarantees. Windows was not locally cross-compiled.
 

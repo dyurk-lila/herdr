@@ -20,10 +20,14 @@ const KNOWN_TOP_LEVEL_CONFIG_KEYS: &[&str] = &[
 ];
 
 pub fn app_dir_name() -> &'static str {
-    if cfg!(debug_assertions) {
-        "herdr-dev"
-    } else {
-        "herdr"
+    app_dir_name_for(crate::build_info::channel(), cfg!(debug_assertions))
+}
+
+fn app_dir_name_for(channel: &str, debug: bool) -> &'static str {
+    match (channel, debug) {
+        (_, true) => "herdr-dev",
+        ("proto", false) => "herdr-proto",
+        (_, false) => "herdr",
     }
 }
 
@@ -750,6 +754,19 @@ fn upsert_section_raw(content: &str, section: &str, key: &str, value: &str) -> S
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn prototype_release_namespace_is_separate_without_changing_upstream_namespaces() {
+        let stable = app_dir_name_for("stable", false);
+        let prototype = app_dir_name_for("proto", false);
+        assert_eq!(stable, "herdr");
+        assert_eq!(prototype, "herdr-proto");
+        assert_ne!(prototype, stable);
+        assert_eq!(app_dir_name_for("preview", false), stable);
+        for channel in ["stable", "preview", "proto"] {
+            assert_eq!(app_dir_name_for(channel, true), "herdr-dev");
+        }
+    }
 
     #[test]
     fn upsert_top_level_bool_replaces_existing_value() {
