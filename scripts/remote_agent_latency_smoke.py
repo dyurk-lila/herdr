@@ -222,7 +222,7 @@ def wait_for_agent(client, remote, session, pane, agent, workdir, timeout=180):
                     remote.cli("--session", session, "pane", "send-keys", pane, "down")
                     last_state = "selecting generated temporary directory trust"
                 continue
-            if "› 1. Yes" in screen or "❯ Yes" in screen:
+            if "› 1. Yes" in screen or "› 1. Trust and continue" in screen or "❯ Yes" in screen:
                 remote.cli("--session", session, "pane", "send-keys", pane, "enter")
                 trust_accepted = True
                 last_state = "generated temporary directory trust accepted"
