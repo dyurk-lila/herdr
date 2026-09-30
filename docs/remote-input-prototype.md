@@ -67,7 +67,7 @@ from an outer terminal unless nested Herdr is intentionally enabled.
 
 ## Validation and limits
 
-The native macOS prototype passed 3,823 tests, formatting/Clippy, maintenance,
+The native macOS prototype passed 3,826 tests, formatting/Clippy, maintenance,
 architecture, integration and documentation checks. Real Claude 2.1.285 editing
 probes measured median Backspace latency of 219 ms without prediction and 0.63 ms
 with prediction. Left/Right, End, insertion, Unicode and learned word deletion

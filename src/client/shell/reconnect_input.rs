@@ -167,8 +167,23 @@ impl ClientShellState {
             return;
         };
         if let Some((anchor, _)) = self.reconnect_anchor(&target) {
-            self.reconnect_drafts
-                .observe(&target, &anchor, generation, Instant::now());
+            let awaiting_echo = self
+                .reconnect_drafts
+                .view(&target)
+                .is_some_and(|view| view.reason == DraftReason::AwaitingEcho);
+            let changed =
+                self.reconnect_drafts
+                    .observe(&target, &anchor, generation, Instant::now());
+            let confirmed = awaiting_echo
+                && changed
+                && self
+                    .reconnect_drafts
+                    .view(&target)
+                    .is_none_or(|view| view.reason == DraftReason::Ready);
+            if confirmed {
+                self.input_prediction
+                    .adopt_reconnect_echo(&target.pane_id, &anchor);
+            }
         }
     }
 

@@ -441,3 +441,111 @@ fn reconnect_draft_underlay_restores_original_link_targets_after_table_remapping
         "https://example.test/surviving"
     );
 }
+
+#[test]
+fn reconnect_draft_settled_recovery_stays_trained_for_next_loss_without_healthy_keys() {
+    let mut state = editor();
+    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    state.handle_input_bytes(b"first");
+    reconnect(&mut state);
+    state.take_reconnect_draft_input().unwrap();
+    echo(&mut state, "› afirst");
+    assert!(state.reconnect_drafts.view(&target()).is_none());
+    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    assert_eq!(
+        state.reconnect_drafts.view(&target()).unwrap().reason,
+        DraftReason::Ready
+    );
+    state.handle_input_bytes("λnext".as_bytes());
+    reconnect(&mut state);
+    assert!(
+        matches!(state.take_reconnect_draft_input(), Some(ClientMessage::ClientShellPaneInput { events,.. }) if events == vec![ClientPaneInputEvent::TextCommit("λnext".into())])
+    );
+    assert!(state.take_reconnect_draft_input().is_none());
+    echo(&mut state, "› afirstλnext");
+    assert!(state.reconnect_drafts.view(&target()).is_none());
+}
+
+#[test]
+fn reconnect_draft_confirmation_restores_exact_middle_cursor_bounds_for_online_edits() {
+    let mut state = editor();
+    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    state.handle_input_bytes(b"abc\x1b[D");
+    reconnect(&mut state);
+    state.take_reconnect_draft_input().unwrap();
+    echo(&mut state, "› aabc");
+    let mut observed = state.pane_surface.clone().unwrap();
+    observed.frame.cursor.as_mut().unwrap().x -= 1;
+    observed.surface_revision += 1;
+    state.set_pane_surface(observed);
+    assert!(state.reconnect_drafts.view(&target()).is_none());
+    let typed = state.handle_input_bytes(b"x");
+    assert_eq!(typed.requests.len(), 1);
+    assert!(state.input_prediction.has_pending());
+    let frame = state.compose(80, 24).unwrap().frame;
+    assert!(frame_rows(&frame).iter().any(|row| row.contains("› aabxc")));
+    // A loss before this ordinary key's echo remains manual/uncertain.
+    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    assert_eq!(
+        state.reconnect_drafts.view(&target()).unwrap().reason,
+        DraftReason::ManualRecovery
+    );
+}
+
+#[test]
+fn reconnect_draft_confirmation_rearms_only_identifiable_software_carets() {
+    for (cursor_x, confirmed) in [(3, false), (5, true)] {
+        let mut state = editor();
+        echo(&mut state, "› abc");
+        let mut observed = state.pane_surface.clone().unwrap();
+        let cursor = observed.frame.cursor.as_mut().unwrap();
+        cursor.visible = false;
+        cursor.x = cursor_x;
+        observed.frame.cells[usize::from(cursor_x)].fg = 0x02_00_00_00;
+        observed.frame.cells[usize::from(cursor_x)].bg = 0x02_ff_ff_ff;
+        observed.surface_revision += 1;
+        state.set_pane_surface(observed);
+        let anchor = state
+            .input_prediction
+            .reconnect_anchor(
+                state.pane_surface.as_ref().unwrap(),
+                "pane_1",
+                crate::detect::Agent::Codex,
+            )
+            .unwrap()
+            .0;
+        state
+            .input_prediction
+            .adopt_reconnect_echo("pane_1", &anchor);
+        assert_eq!(
+            state
+                .input_prediction
+                .reconnect_anchor(
+                    state.pane_surface.as_ref().unwrap(),
+                    "pane_1",
+                    crate::detect::Agent::Codex,
+                )
+                .unwrap()
+                .1,
+            confirmed
+        );
+        if !confirmed {
+            let before = state.compose(80, 24).unwrap().frame;
+            assert!(!state
+                .handle_input_bytes(b"\x1b[D\x1b[3~")
+                .requests
+                .is_empty());
+            assert!(!state.input_prediction.has_pending());
+            assert_eq!(state.compose(80, 24).unwrap().frame, before);
+        }
+        state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+        assert_eq!(
+            state.reconnect_drafts.view(&target()).unwrap().reason,
+            if confirmed {
+                DraftReason::Ready
+            } else {
+                DraftReason::ManualRecovery
+            }
+        );
+    }
+}

@@ -50,6 +50,16 @@ BURST = (
     + EDIT_KEYS[EditOperation.END] + b"z"
 )
 EXPECTED_FAILURES = (OSError, RuntimeError, ValueError, subprocess.SubprocessError)
+MAX_DIAGNOSTIC_RECORDS = 64
+MISMATCH_BOOL_FIELDS = (
+    "boot_changed", "agent_changed", "geometry_changed", "size_changed",
+    "modes_changed", "cursor_visibility_changed", "cursor_changed",
+    "bounds_changed", "row_length_changed",
+)
+MISMATCH_COUNT_FIELDS = (
+    "symbol_changes", "style_changes", "skip_changes", "hyperlink_changes",
+)
+LOG_FIELD = re.compile(r'(?<!\S)([a-z_]+)=(?:"([^"]*)"|([^\s]+))(?=\s|$)')
 
 
 class Scenario(StrEnum):
@@ -63,6 +73,17 @@ class BridgePhase(StrEnum):
     RELEASED = "released"
 
 
+class MismatchPhase(StrEnum):
+    ATTEMPT = "attempt"
+    OBSERVE = "observe"
+
+
+class RestoreFailure(RuntimeError):
+    def __init__(self, diagnosis):
+        super().__init__("Restored editor did not match the generated draft and cursor")
+        self.diagnosis = diagnosis
+
+
 @dataclass
 class BridgeEvent:
     pid: int
@@ -70,6 +91,51 @@ class BridgeEvent:
     session: str
     phase: BridgePhase
     timestamp_ns: int
+
+
+def parse_reconnect_diagnostics(lines):
+    result = {"context_mismatches": [], "echo_timeouts": 0, "malformed_records": 0, "omitted_records": 0}
+    for line in lines:
+        fields = {match[1]: match[2] if match[2] is not None else match[3] for match in LOG_FIELD.finditer(line)}
+        if "event" not in fields:
+            continue
+        if fields["event"] == "reconnect.echo_timeout":
+            result["echo_timeouts"] += 1
+            continue
+        if fields["event"] == "reconnect.context_mismatch":
+            required = ("phase", *MISMATCH_BOOL_FIELDS, *MISMATCH_COUNT_FIELDS)
+            if any(name not in fields for name in required):
+                result["malformed_records"] += 1
+                continue
+            if fields["phase"] not in (MismatchPhase.ATTEMPT, MismatchPhase.OBSERVE) or any(fields[name] not in ("true", "false") for name in MISMATCH_BOOL_FIELDS) or any(re.fullmatch(r"[0-9]+", fields[name]) is None for name in MISMATCH_COUNT_FIELDS):
+                result["malformed_records"] += 1
+                continue
+            record = {"phase": fields["phase"]}
+            record.update({name: fields[name] == "true" for name in MISMATCH_BOOL_FIELDS})
+            record.update({name: int(fields[name]) for name in MISMATCH_COUNT_FIELDS})
+        else:
+            continue
+        if len(result["context_mismatches"]) >= MAX_DIAGNOSTIC_RECORDS:
+            result["omitted_records"] += 1
+        else:
+            result["context_mismatches"].append(record)
+    return result
+
+
+def collect_reconnect_diagnostics(case_dir):
+    paths = list((case_dir / "config").rglob("herdr-client.log"))
+    if len(paths) > 1:
+        raise RuntimeError("Expected at most one owned native-client diagnostic log")
+    if not paths:
+        return parse_reconnect_diagnostics(())
+    path = paths[0]
+    try:
+        if path.is_symlink() or path.stat().st_size > 8 * 1024 * 1024:
+            raise RuntimeError("Owned native-client diagnostic log exceeded its bounds")
+        with path.open(encoding="utf-8") as lines:
+            return parse_reconnect_diagnostics(lines)
+    finally:
+        path.unlink(missing_ok=True)
 
 
 class BridgeGate:
@@ -185,15 +251,29 @@ def require_authoritative(remote, session, pane, expected, agent):
 
 def wait_restored(client, remote, session, pane, expected, agent, *, cursor_at_end=True):
     deadline = time.monotonic() + 45
-    while time.monotonic() < deadline:
+    while True:
         client.pump(.1)
-        rows = draft_rows(authoritative(remote, session, pane), expected, agent=agent)
+        source = authoritative(remote, session, pane)
+        rows = draft_rows(source, expected, agent=agent)
         client.pump(0)
         local_rows = draft_rows(client.screen.text(), expected, composed=True, agent=agent)
         cursor_matches = not cursor_at_end or exact_draft_cursor(client.screen, expected, len(expected))
         if len(rows) == 1 and len(local_rows) == 1 and cursor_matches:
             return {"generated_draft": expected, "exact_row_count": 1, "local": client.screen.evidence(expected)}
-    raise RuntimeError("Restored editor did not match the generated draft and cursor")
+        if time.monotonic() >= deadline:
+            candidates = (BASE_DRAFT, BASE_DRAFT + BURST_SUFFIX, BASE_DRAFT + BURST_SUFFIX + SECOND_SUFFIX, CHANGED_DRAFT, expected)
+            raise RestoreFailure({
+                "expected_draft": expected,
+                "expected_authoritative_row_count": len(rows),
+                "expected_local_row_count": len(local_rows),
+                "local_cursor_matches": cursor_matches,
+                "authoritative_generated_matches": {
+                    draft: len(draft_rows(source, draft, agent=agent))
+                    for draft in dict.fromkeys(candidates)
+                },
+                "local_cursor": client.screen.evidence()["outer_cursor"],
+                "panel": panel_state(client, BURST_SUFFIX),
+            })
 
 
 def panel_state(client, suffix):
@@ -230,7 +310,7 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
     config.write_text(f"onboarding=false\n[remote]\npredict_input=true\nbuffer_reconnect_input={str(enabled).lower()}\nmanage_ssh_config=false\n", encoding="utf-8")
     gate.select(session)
     env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
-    env.update(TERM="xterm-256color", COLORTERM="truecolor", HERDR_CONFIG_PATH=str(config), XDG_CONFIG_HOME=str(case_dir / "config"), XDG_STATE_HOME=str(case_dir / "state"))
+    env.update(TERM="xterm-256color", COLORTERM="truecolor", HERDR_CONFIG_PATH=str(config), XDG_CONFIG_HOME=str(case_dir / "config"), XDG_STATE_HOME=str(case_dir / "state"), HERDR_LOG="herdr::client::shell::reconnect_draft=debug")
     client = AgentClient([str(Path(args.binary).resolve()), "--remote", args.target, "--session", session], env, case_dir, agent)
     pane, workdir = None, None
     case = {"session": session, "agent": agent, "buffer_reconnect_input": enabled, "scenario": scenario, "binary_sha256": binary_digest(args.binary), "submitted_prompt": False, "passed": False}
@@ -310,6 +390,8 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
         case["passed"] = True
     except EXPECTED_FAILURES as error:
         case["error"] = str(error)
+        if isinstance(error, RestoreFailure):
+            case["restore_failure"] = error.diagnosis
     finally:
         case["final_panel"] = panel_state(client, BURST_SUFFIX)
         case["final_generated_evidence"] = client.screen.evidence(BASE_DRAFT)
@@ -335,6 +417,10 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
             except EXPECTED_FAILURES as error:
                 cleanup.append(f"own generated directory: {error}")
         case["cleanup_errors"] = cleanup
+        try:
+            case["reconnect_diagnostics"] = collect_reconnect_diagnostics(case_dir)
+        except (OSError, RuntimeError, UnicodeError) as error:
+            cleanup.append(f"own structural diagnostic log: {type(error).__name__}")
         case["raw_terminal_bytes"] = (case_dir / "terminal.ansi").stat().st_size
         if cleanup:
             case["passed"] = False
@@ -343,8 +429,27 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
 
 
 def self_test():
+    mismatch = 'event="reconnect.context_mismatch" phase="observe" ' + " ".join(f"{name}=false" for name in MISMATCH_BOOL_FIELDS) + " " + " ".join(f"{name}=0" for name in MISMATCH_COUNT_FIELDS)
+    parsed = parse_reconnect_diagnostics((
+        'unrelated secret="never-retain"',
+        mismatch + ' target="never-retain" pane_id="never-retain" draft="never-retain"',
+        'event="reconnect.echo_timeout" draft="never-retain"',
+        'event="reconnect.context_mismatch" phase="unexpected"',
+    ))
+    assert len(parsed["context_mismatches"]) == 1
+    assert set(parsed["context_mismatches"][0]) == {"phase", *MISMATCH_BOOL_FIELDS, *MISMATCH_COUNT_FIELDS}
+    assert parsed["echo_timeouts"] == 1
+    assert parsed["malformed_records"] == 1 and "never-retain" not in json.dumps(parsed)
+    bounded = parse_reconnect_diagnostics((mismatch for _ in range(MAX_DIAGNOSTIC_RECORDS + 1)))
+    assert len(bounded["context_mismatches"]) == MAX_DIAGNOSTIC_RECORDS and bounded["omitted_records"] == 1
     with tempfile.TemporaryDirectory(prefix="herdr-rdraft-selftest-", dir="/tmp") as tmp:
         root = Path(tmp)
+        log = root / "config/herdr-proto/sessions/generated/herdr-client.log"
+        log.parent.mkdir(parents=True)
+        log.write_text(mismatch + '\nignored secret="never-retain"\n')
+        collected = collect_reconnect_diagnostics(root)
+        assert len(collected["context_mismatches"]) == 1 and not log.exists()
+        assert "never-retain" not in json.dumps(collected)
         fake = root / "ssh-stub"
         fake.write_text("#!/bin/sh\nexit 0\n")
         fake.chmod(0o700)
@@ -371,7 +476,7 @@ def self_test():
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=5)
-    print("owned bridge gate, control bypass, foreign-session refusal, and release assertions passed")
+    print("owned bridge gate, control bypass, foreign-session refusal, release, and bounded structural-only diagnostics assertions passed")
 
 
 def main():

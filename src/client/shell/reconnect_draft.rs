@@ -40,6 +40,49 @@ pub(super) struct DraftAnchor {
 }
 
 impl DraftAnchor {
+    fn trace_mismatch(&self, current: &Self, phase: &'static str) {
+        // Diagnostics contain structural differences only, never input or row text.
+        tracing::debug!(
+            event = "reconnect.context_mismatch",
+            phase,
+            boot_changed = self.boot_id != current.boot_id,
+            agent_changed = self.agent != current.agent,
+            geometry_changed = self.geometry != current.geometry,
+            size_changed = self.surface_size != current.surface_size,
+            modes_changed = self.terminal_modes != current.terminal_modes,
+            cursor_visibility_changed = self.cursor_visible != current.cursor_visible,
+            cursor_changed = (self.x, self.y) != (current.x, current.y),
+            bounds_changed =
+                (self.input_start, self.input_end) != (current.input_start, current.input_end),
+            row_length_changed = self.row.len() != current.row.len(),
+            symbol_changes = self
+                .row
+                .iter()
+                .zip(&current.row)
+                .filter(|(a, b)| a.symbol != b.symbol)
+                .count(),
+            style_changes = self
+                .row
+                .iter()
+                .zip(&current.row)
+                .filter(|(a, b)| (a.fg, a.bg, a.modifier) != (b.fg, b.bg, b.modifier))
+                .count(),
+            skip_changes = self
+                .row
+                .iter()
+                .zip(&current.row)
+                .filter(|(a, b)| a.skip != b.skip)
+                .count(),
+            hyperlink_changes = self
+                .row
+                .iter()
+                .zip(&current.row)
+                .filter(|(a, b)| a.hyperlink != b.hyperlink)
+                .count(),
+            "reconnect recovery held"
+        );
+    }
+
     fn valid(&self) -> bool {
         let Some(x) = self.x.checked_sub(self.geometry.x) else {
             return false;
@@ -146,6 +189,10 @@ impl Draft {
         if self.pending.as_ref().is_some_and(|pending| {
             now.saturating_duration_since(pending.started) >= ATTEMPT_TIMEOUT
         }) {
+            tracing::debug!(
+                event = "reconnect.echo_timeout",
+                "reconnect echo unconfirmed"
+            );
             self.make_uncertain()
         } else {
             false
@@ -344,6 +391,7 @@ impl ReconnectDrafts {
             return None;
         };
         if !current.valid() || anchor != current {
+            anchor.trace_mismatch(current, "attempt");
             draft.allow_auto = false;
             draft.reason = DraftReason::ContextChanged;
             return None;
@@ -404,6 +452,9 @@ impl ReconnectDrafts {
             return false;
         }
         if draft.allow_auto && draft.anchor.as_ref() != Some(current) {
+            if let Some(anchor) = &draft.anchor {
+                anchor.trace_mismatch(current, "observe");
+            }
             draft.allow_auto = false;
             draft.reason = DraftReason::ContextChanged;
             return true;

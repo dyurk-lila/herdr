@@ -552,6 +552,69 @@ impl InputPrediction {
         ))
     }
 
+    /// Only the draft model's exact, same-generation echo may restore this baseline.
+    pub(super) fn adopt_reconnect_echo(
+        &mut self,
+        pane_id: &str,
+        anchor: &super::reconnect_draft::DraftAnchor,
+    ) {
+        // Never overwrite an independently outstanding online input history.
+        if self.line.is_some() {
+            return;
+        }
+        self.set_agent_context(Some(anchor.agent));
+        let word_rules = self
+            .machine_context
+            .as_ref()
+            .filter(|_| self.profile_resume_epoch.is_none())
+            .and_then(|machine| {
+                self.profiles
+                    .profile(machine, crate::detect::agent_label(anchor.agent))
+            })
+            .map_or_else(
+                || std::array::from_fn(|_| WordRules::default()),
+                |profile| profile.word_rules.clone(),
+            );
+        let mut line = PredictedLine {
+            boot_id: anchor.boot_id.clone(),
+            pane_id: pane_id.to_owned(),
+            geometry: anchor.geometry,
+            surface_size: anchor.surface_size,
+            terminal_modes: anchor.terminal_modes,
+            cursor_visible: anchor.cursor_visible,
+            y: anchor.y,
+            x: anchor.x,
+            input_start: anchor.geometry.x + anchor.input_start as u16,
+            input_end: anchor.geometry.x + anchor.input_end as u16,
+            software_style: None,
+            row: anchor.row.clone(),
+            initial_row: anchor.row.clone(),
+            initial_empty: anchor.input_start == anchor.input_end,
+            profile_published: false,
+            profile_epoch: self.profiles.epoch(),
+            placeholder: None,
+            projection: EditProjection::default(),
+            pending: VecDeque::new(),
+            trained: true,
+            expired: false,
+            word_rules,
+            word_learning: None,
+            click_trained: false,
+            last_click: None,
+            mouse_down: false,
+        };
+        line.software_style = line
+            .software_cursor()
+            .map(|cursor| (cursor.cell.clone(), cursor.padding.clone()));
+        // An exact text echo does not identify a painted caret over nonblank text.
+        // Wait for ordinary input to establish its style rather than guessing it.
+        if !line.cursor_visible && line.software_style.is_none() {
+            return;
+        }
+        line.reset_projection();
+        self.line = Some(line);
+    }
+
     pub(crate) fn set_profiles(&mut self, profiles: Profiles) -> bool {
         if profiles.epoch() < self.profiles.epoch()
             || self

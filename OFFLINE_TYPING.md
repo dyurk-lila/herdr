@@ -30,8 +30,11 @@ An unchanged picture is a heuristic, not an application-supported prompt epoch.
 
 Each suffix is marked attempted **before** transport enqueue and attempted only
 once. Exact text/cursor echo in the same connection generation retires it. New
-text typed while awaiting echo stays separate until that echo arrives. A second
-drop, a changed generation, or three seconds without confirmation preserves the
+text typed while awaiting echo stays separate until that echo arrives. Its
+confirmed echo restores live prediction confidence when the caret is identifiable,
+so another settled drop needs no intervening healthy keystroke to recover. A
+hidden caret painted over text needs fresh learning. A second drop before confirmation,
+a changed generation, or three seconds without confirmation preserves the
 attempt as uncertain and prevents automatic resend. Copy recovery composes later
 edits at the attempted cursor, including middle insertion.
 
