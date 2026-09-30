@@ -1,5 +1,13 @@
 # herdr
 
+This fork's `dyurk/remote-input-proto` branch adds opt-in local prediction for
+remote typing and composed edits, with learning shared across agent sessions.
+See the [feature and setup guide](docs/remote-input-prototype.md),
+[editing design](docs/remote-editing-design.md), and
+[upstream update contract](docs/prototype-maintenance.md).
+Reliable typing through disconnects is [scoped separately](OFFLINE_TYPING.md)
+and is not implemented.
+
 
 <p align="center">
   <img src="assets/logo.png" alt="herdr" width="100" />
