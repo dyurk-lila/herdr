@@ -5,8 +5,8 @@ remote typing and composed edits, with learning shared across agent sessions.
 See the [feature and setup guide](docs/remote-input-prototype.md),
 [editing design](docs/remote-editing-design.md), and
 [upstream update contract](docs/prototype-maintenance.md).
-Reliable typing through disconnects is [scoped separately](OFFLINE_TYPING.md)
-and is not implemented.
+Optional [local reconnect drafts](OFFLINE_TYPING.md) keep outage edits available
+and attempt guarded recovery once. Reliable resumable delivery remains future work.
 
 
 <p align="center">

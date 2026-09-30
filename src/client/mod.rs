@@ -466,6 +466,8 @@ async fn run_client_loop(
         redraw_on_focus_gained: config.redraw_on_focus_gained,
         repaint_pending: false,
         presentation_frozen: false,
+        frozen_reconnect_base: None,
+        presented_reconnect_underlay: None,
         deferred_local_activation: None,
         draw_host_cursor,
         detached_process_children: Vec::new(),
@@ -849,6 +851,10 @@ async fn run_client_loop(
         let now = std::time::Instant::now();
         if let Some(shell) = state.shell.as_mut() {
             shell.tick_popup_pending(now);
+            let ready = pending_activation.is_none()
+                && write_stream.active_surface_available()
+                && shell.endpoint_is_online(write_stream.active_id());
+            shell.set_reconnect_input_ready(ready);
         }
 
         match event {

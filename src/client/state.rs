@@ -73,6 +73,8 @@ pub(super) struct ClientState {
     /// During a source-off-first handoff the currently blitted frame remains authoritative until
     /// an acknowledged target snapshot/surface pair commits.
     pub(super) presentation_frozen: bool,
+    pub(super) frozen_reconnect_base: Option<crate::protocol::FrameData>,
+    pub(super) presented_reconnect_underlay: Option<shell::reconnect_input::ReconnectPanelUnderlay>,
     /// Latest explicit Local selection awaiting this client's replacement Local connection.
     pub(super) deferred_local_activation: Option<endpoint::EndpointActivationIntent>,
     pub(super) draw_host_cursor: bool,
@@ -130,6 +132,8 @@ impl ClientState {
             redraw_on_focus_gained: false,
             repaint_pending: false,
             presentation_frozen: false,
+            frozen_reconnect_base: None,
+            presented_reconnect_underlay: None,
             deferred_local_activation: None,
             draw_host_cursor: false,
             detached_process_children: Vec::new(),
@@ -144,6 +148,22 @@ impl ClientState {
     }
 
     pub(super) fn freeze_presentation(&mut self) {
+        if (!self.presentation_frozen || self.frozen_reconnect_base.is_none())
+            && self
+                .shell
+                .as_ref()
+                .is_some_and(|shell| shell.has_reconnect_draft())
+        {
+            self.frozen_reconnect_base = self.blit_encoder.current_frame().map(|source| {
+                let mut frame = self
+                    .presented_reconnect_underlay
+                    .as_ref()
+                    .map_or_else(|| source.clone(), |underlay| underlay.clean_base(source));
+                frame.graphics.clear();
+                frame.cursor = None;
+                frame
+            });
+        }
         self.presentation_frozen = true;
     }
 
@@ -194,6 +214,7 @@ impl ClientState {
 
     pub(super) fn unfreeze_presentation(&mut self) {
         self.presentation_frozen = false;
+        self.frozen_reconnect_base = None;
         // A resize or metadata event may have happened while frozen. Force a full frame rather
         // than attempting to patch the old source frame.
         self.request_repaint();
@@ -214,6 +235,22 @@ impl ClientState {
         if let Some(cleanup) = deferred_cleanup {
             self.pending_native_cleanup = cleanup;
         }
+    }
+
+    pub(super) fn frozen_reconnect_draft_frame(&mut self) -> Option<crate::protocol::FrameData> {
+        if !self.presentation_frozen {
+            return None;
+        }
+        if self.frozen_reconnect_base.is_none() {
+            self.freeze_presentation();
+        }
+        let base = self.frozen_reconnect_base.as_ref()?;
+        Some(
+            self.shell
+                .as_mut()?
+                .project_reconnect_draft(base)
+                .unwrap_or_else(|| base.clone()),
+        )
     }
 
     #[cfg(unix)]
@@ -567,6 +604,10 @@ impl ClientState {
             self.repaint_pending = true;
             return false;
         }
+        self.presented_reconnect_underlay = self
+            .shell
+            .as_mut()
+            .and_then(|shell| shell.take_reconnect_underlay());
         self.blit_encoder.commit(frame_data, encoded);
         self.repaint_pending = false;
         true

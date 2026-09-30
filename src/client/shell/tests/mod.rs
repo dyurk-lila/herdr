@@ -261,4 +261,5 @@ mod mouse_selection;
 mod popup_focus_projection;
 mod prediction;
 mod prediction_mouse;
+mod reconnect_draft;
 mod startup_overlays;

@@ -45,6 +45,7 @@ Enable this opt-in setting in the prototype client's configuration:
 ```toml
 [remote]
 predict_input = true
+buffer_reconnect_input = true # optional local drafts during reconnect
 ```
 
 Connect with `herdr-proto --remote YOUR_SSH_ALIAS --session YOUR_SESSION`, or save
@@ -66,7 +67,7 @@ from an outer terminal unless nested Herdr is intentionally enabled.
 
 ## Validation and limits
 
-The native macOS prototype passed 3,792 tests, formatting/Clippy, maintenance,
+The native macOS prototype passed 3,823 tests, formatting/Clippy, maintenance,
 architecture, integration and documentation checks. Real Claude 2.1.285 editing
 probes measured median Backspace latency of 219 ms without prediction and 0.63 ms
 with prediction. Left/Right, End, insertion, Unicode and learned word deletion
@@ -104,4 +105,13 @@ matching echoes are evidence, not a
 permission guarantee. An unexpected predicted echo invalidates that machine/agent
 profile; input itself is always forwarded once, regardless of prediction.
 
-Disconnected input is currently discarded. [OFFLINE_TYPING.md](../OFFLINE_TYPING.md) scopes reliable offline draft recovery with resumable server acknowledgements; that extension is not implemented here. [Prototype maintenance](prototype-maintenance.md) describes updating this branch against later stable releases.
+With `buffer_reconnect_input`, detected outages open an editable local reconnect
+draft. Editing continues through the entire reconnect handshake. A confirmed,
+unchanged Claude/Codex row permits one best-effort insertion after activation;
+changed context or uncertain delivery offers Copy/Discard and never retries.
+Drafts are bounded, client-local and volatile. Editing applies to the never-sent
+suffix; Enter and unsupported controls are not queued. See
+[offline typing](../OFFLINE_TYPING.md) for recovery gates and delivery limits.
+Reliable resumable delivery still requires server acknowledgements.
+[Prototype maintenance](prototype-maintenance.md) describes keeping these
+constraints through later stable releases.

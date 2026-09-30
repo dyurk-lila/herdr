@@ -61,6 +61,9 @@ fn fast_path_blocker(
     if state.input_prediction.has_pending() {
         // A partial blit cannot erase every speculative cell on confirmation or rollback.
         Some("client_surface_patch.fallback.prediction")
+    } else if state.reconnect_display_target().is_some() {
+        // Retained patches must not overwrite a local draft panel or its cursor.
+        Some("client_surface_patch.fallback.reconnect_draft")
     } else if state.mode != ClientShellMode::Terminal {
         Some("client_surface_patch.fallback.mode")
     } else if state.overlay.is_some() {

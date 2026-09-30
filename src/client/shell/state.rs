@@ -14,6 +14,7 @@ pub(crate) enum ClientShellKeybindingSource {
 
 pub(crate) struct ClientShellConfig {
     pub(super) remote_predict_input: bool,
+    pub(super) remote_buffer_reconnect_input: bool,
     pub(super) sidebar_width: u16,
     pub(super) sidebar_min_width: u16,
     pub(super) sidebar_max_width: u16,
@@ -84,6 +85,9 @@ pub(super) enum ClientMobileTarget {
 
 #[derive(Default)]
 pub(super) struct ShellHitMap {
+    pub(super) reconnect_panel: Rect,
+    pub(super) reconnect_copy: Rect,
+    pub(super) reconnect_discard: Rect,
     pub(super) machines: Vec<MachineHit>,
     pub(super) workspaces: Vec<WorkspaceHit>,
     pub(super) workspace_body: Rect,
@@ -849,6 +853,9 @@ pub(crate) struct ClientShellState {
     pub(super) config: ClientShellConfig,
     pub(super) primary_remote: bool,
     pub(super) input_prediction: super::prediction::InputPrediction,
+    pub(super) reconnect_drafts: super::reconnect_draft::ReconnectDrafts,
+    pub(super) reconnect_panel_underlay: Option<super::reconnect_input::ReconnectPanelUnderlay>,
+    pub(super) reconnect_input_ready: bool,
     pub(super) snapshot: Option<Box<ClientShellSnapshot>>,
     pub(super) active_snapshot_generation: Option<u64>,
     pub(super) pane_surface_generation: Option<u64>,
@@ -1015,6 +1022,9 @@ impl ClientShellState {
             config,
             primary_remote: false,
             input_prediction: super::prediction::InputPrediction::default(),
+            reconnect_drafts: Default::default(),
+            reconnect_panel_underlay: None,
+            reconnect_input_ready: false,
             snapshot: None,
             active_snapshot_generation: None,
             pane_surface_generation: None,

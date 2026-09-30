@@ -133,6 +133,11 @@ impl BlitEncoder {
         self.last_frame = Some(frame);
     }
 
+    /// The last successfully presented semantic frame, for local chrome over a frozen surface.
+    pub(crate) fn current_frame(&self) -> Option<&FrameData> {
+        self.last_frame.as_ref()
+    }
+
     pub(crate) fn is_current(&self, frame: &FrameData) -> bool {
         self.last_frame.as_ref() == Some(frame)
     }

@@ -1062,6 +1062,9 @@ pub struct RemoteConfig {
     /// Predict simple remote pane typing after observing matching echo. Default: false.
     /// Unconfirmed text is underlined; applications can change their echo behavior.
     pub predict_input: bool,
+    /// Keep a local draft during reconnect. Recovery uses editor evidence,
+    /// rather than a server delivery acknowledgement. Default: false.
+    pub buffer_reconnect_input: bool,
 }
 
 impl Default for RemoteConfig {
@@ -1069,6 +1072,7 @@ impl Default for RemoteConfig {
         Self {
             manage_ssh_config: true,
             predict_input: false,
+            buffer_reconnect_input: false,
         }
     }
 }

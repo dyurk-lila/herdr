@@ -1464,7 +1464,13 @@
           "key": "remote.predict_input",
           "type": "boolean",
           "default": "false",
-          "description": "Opt in to conservative local echo for remote panes after matching server echo. Unconfirmed ASCII typing is underlined; prediction resets on controls, uncertain output, and context changes. Echo permission is not available in the current protocol, so applications that change echo behavior can briefly display unexpected input."
+          "description": "Opt in to conservative local echo for remote panes after matching server echo. Unconfirmed single-cell text and supported composed edits are underlined; uncertain output and context changes reset prediction. Echo permission is not available in the current protocol, so applications that change echo behavior can briefly display unexpected input."
+        },
+        {
+          "key": "remote.buffer_reconnect_input",
+          "type": "boolean",
+          "default": "false",
+          "description": "Keep an editable local draft during remote reconnects. Automatically send never-sent single-cell text only after the original trained editor is restored; changed contexts or uncertain delivery retain the draft for copy recovery. Requires predict_input for automatic training. In-memory drafts do not survive client exit."
         }
       ]
     },

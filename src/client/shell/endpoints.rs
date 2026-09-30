@@ -147,6 +147,9 @@ impl ClientShellState {
             self.clear_machine_diagnostic(endpoint_id);
         }
         if endpoint_id == &self.active_endpoint_id && status != ClientEndpointStatus::Online {
+            if status == ClientEndpointStatus::Reconnecting {
+                self.begin_reconnect_draft();
+            }
             self.pending_workspace_highlight = None;
             self.input_prediction.clear();
         }

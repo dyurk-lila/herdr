@@ -507,6 +507,51 @@ impl PredictedLine {
 }
 
 impl InputPrediction {
+    pub(super) fn reconnect_anchor(
+        &self,
+        surface: &PaneSurfaceFrame,
+        pane_id: &str,
+        agent: crate::detect::Agent,
+    ) -> Option<(super::reconnect_draft::DraftAnchor, bool)> {
+        let row = eligible_row(surface, pane_id)?;
+        let start = agent_prompt_start(row.cells, agent)?;
+        let cursor = usize::from(row.x - row.geometry.x);
+        if cursor < start {
+            return None;
+        }
+        let end = row.cells[start..]
+            .iter()
+            .rposition(|cell| cell.symbol != " ")
+            .map_or(start, |index| start + index + 1)
+            .max(cursor);
+        let confirmed = self.line.as_ref().is_some_and(|line| {
+            line.pane_id == pane_id
+                && line.matches_context(surface, &row)
+                && line.trained
+                && line.pending.is_empty()
+                && line.word_learning.is_none()
+                && line.x == row.x
+                && line.row == row.cells
+                && usize::from(line.input_end - line.geometry.x) == end
+        });
+        Some((
+            super::reconnect_draft::DraftAnchor {
+                boot_id: surface.boot_id.clone(),
+                agent,
+                geometry: row.geometry,
+                surface_size: (surface.frame.width, surface.frame.height),
+                terminal_modes: row.terminal_modes,
+                cursor_visible: row.cursor_visible,
+                x: row.x,
+                y: row.y,
+                row: row.cells.to_vec(),
+                input_start: start,
+                input_end: end,
+            },
+            confirmed,
+        ))
+    }
+
     pub(crate) fn set_profiles(&mut self, profiles: Profiles) -> bool {
         if profiles.epoch() < self.profiles.epoch()
             || self

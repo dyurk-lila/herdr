@@ -140,6 +140,7 @@ impl ClientShellState {
     }
 
     pub(super) fn reconcile_prediction(&mut self) {
+        self.observe_reconnect_draft();
         if !self.prediction_allowed() {
             self.input_prediction.clear();
         } else if let Some(surface) = self.pane_surface.as_ref() {
@@ -152,10 +153,11 @@ impl ClientShellState {
     }
 
     pub(crate) fn tick_prediction(&mut self, now: Instant) -> bool {
+        let draft_repaint = self.reconnect_drafts.tick(now);
         if !self.prediction_context_allowed() {
-            self.input_prediction.clear()
+            self.input_prediction.clear() | draft_repaint
         } else {
-            self.input_prediction.expire(now)
+            self.input_prediction.expire(now) | draft_repaint
         }
     }
 }

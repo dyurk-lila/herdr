@@ -405,6 +405,7 @@ pub(super) fn complete_endpoint_activation(
         return Ok(None);
     }
 
+    let activated = completion == endpoint::ActivationCompletion::Activated;
     let _ = pending.take();
     endpoints.unfreeze_input();
     let successor = match completion {
@@ -413,6 +414,9 @@ pub(super) fn complete_endpoint_activation(
             successor: next,
             ..
         } => {
+            if let Some(shell) = state.shell.as_mut() {
+                shell.block_reconnect_draft_recovery();
+            }
             if next.is_none() {
                 if let Some(shell) = state.shell.as_mut() {
                     shell.receive_endpoint_unavailable(error);
@@ -431,6 +435,20 @@ pub(super) fn complete_endpoint_activation(
         if let Some(shell) = state.shell.as_mut() {
             for request_id in cancelled {
                 shell.cancel_endpoint_request(&request_id);
+            }
+        }
+    }
+    if activated
+        && state.deferred_local_activation.is_none()
+        && endpoints.active_surface_available()
+    {
+        if let Some(shell) = state.shell.as_mut() {
+            let ready = shell.endpoint_is_online(endpoints.active_id());
+            shell.set_reconnect_input_ready(ready);
+            if ready {
+                if let Some(request) = shell.take_reconnect_draft_input() {
+                    write_to_server(endpoints, &request).map_err(ClientError::ConnectionLost)?;
+                }
             }
         }
     }
@@ -680,6 +698,7 @@ pub(super) fn finish_client_shell_input(
     prefix_input_source: &mut impl crate::platform::PrefixInputSource,
     scheduled_activation: &mut Option<ClientLoopEvent>,
 ) -> Result<bool, ClientError> {
+    let repaint = outcome.repaint;
     apply_client_shell_input_source_changes(state, prefix_input_source);
     if outcome.detach {
         let _ = write_to_server(endpoints, &ClientMessage::Detach);
@@ -736,6 +755,16 @@ pub(super) fn finish_client_shell_input(
         .as_ref()
         .is_none_or(|shell| shell.endpoint_is_online(endpoints.active_id()))
         && endpoints.active_surface_available();
+    let ready = active_endpoint_online && pending_activation.is_none();
+    if let Some(shell) = state.shell.as_mut() {
+        shell.set_reconnect_input_ready(ready);
+        if ready {
+            if let Some(request) = shell.take_reconnect_draft_input() {
+                // Marked attempted before transport enqueue; never retried automatically.
+                write_to_server(endpoints, &request).map_err(ClientError::ConnectionLost)?;
+            }
+        }
+    }
     for request in outcome.requests {
         if let ClientMessage::ClientShellHostTheme { update } = &request {
             state.record_host_theme_update(update);
@@ -786,7 +815,13 @@ pub(super) fn finish_client_shell_input(
         }
         write_to_server(endpoints, &request).map_err(ClientError::ConnectionLost)?;
     }
-    if let Some(frame) = frame {
+    if pending_activation.is_some() && state.presentation_frozen {
+        if repaint {
+            if let Some(local_frame) = state.frozen_reconnect_draft_frame() {
+                state.present_frozen_chrome(local_frame);
+            }
+        }
+    } else if let Some(frame) = frame {
         if pending_activation.is_some() {
             state.present_frame(frame);
         } else {

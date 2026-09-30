@@ -1,6 +1,6 @@
 use super::*;
 
-fn remote_shell(enabled: bool, remote: bool) -> ClientShellState {
+pub(super) fn remote_shell(enabled: bool, remote: bool) -> ClientShellState {
     let mut config = Config::default();
     config.remote.predict_input = enabled;
     let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
@@ -30,7 +30,7 @@ fn remote_shell(enabled: bool, remote: bool) -> ClientShellState {
     state
 }
 
-fn echo(state: &mut ClientShellState, text: &str) {
+pub(super) fn echo(state: &mut ClientShellState, text: &str) {
     let mut next = state.pane_surface.clone().expect("authoritative surface");
     for cell in &mut next.frame.cells[..usize::from(next.frame.width)] {
         cell.symbol = " ".into();
@@ -633,77 +633,6 @@ fn remote_prediction_render_scale_profile() {
     const UPDATES: u64 = 64;
     const SAMPLES: usize = 9;
 
-    fn populated_shell(pane_count: usize, prediction: bool) -> ClientShellState {
-        let mut config = Config::default();
-        config.remote.predict_input = prediction;
-        let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
-        state.primary_remote = true;
-        let mut snapshot = snapshot();
-        for index in 1..pane_count {
-            let mut pane = snapshot.panes[0].clone();
-            pane.pane_id = format!("pane_{}", index + 1);
-            pane.focused = false;
-            snapshot.panes.push(pane);
-        }
-        state.set_snapshot(Box::new(snapshot));
-        let size = state.surface_size(COLS, ROWS);
-        assert!(usize::from(size.rows) >= pane_count * 2);
-        let mut initial = surface();
-        let pane_template = initial.panes[0].clone();
-        initial.panes = (0..pane_count)
-            .map(|index| {
-                let y = (usize::from(size.rows) * index / pane_count) as u16;
-                let bottom = (usize::from(size.rows) * (index + 1) / pane_count) as u16;
-                let mut pane = pane_template.clone();
-                pane.pane_id = format!("pane_{}", index + 1);
-                pane.focused = index == 0;
-                pane.rect = SurfaceRect {
-                    x: 0,
-                    y,
-                    width: size.cols,
-                    height: bottom - y,
-                };
-                pane.inner_rect = pane.rect;
-                pane
-            })
-            .collect();
-        initial.frame = FrameData::from_ratatui_buffer(
-            &Buffer::empty(Rect::new(0, 0, size.cols, size.rows)),
-            Some(crate::protocol::CursorState {
-                x: 2,
-                y: 0,
-                visible: true,
-                shape: 2,
-            }),
-        );
-        for (index, pane) in initial.panes.iter().enumerate() {
-            for y in pane.inner_rect.y..pane.inner_rect.y + pane.inner_rect.height {
-                let text = format!(
-                    "pane {:02} row {y:02}: populated terminal output ",
-                    index + 1
-                );
-                for x in 0..size.cols {
-                    initial.frame.cells[usize::from(y) * usize::from(size.cols) + usize::from(x)]
-                        .symbol =
-                        char::from(text.as_bytes()[usize::from(x) % text.len()]).to_string();
-                }
-            }
-        }
-        for cell in &mut initial.frame.cells[..usize::from(size.cols)] {
-            cell.symbol = " ".into();
-        }
-        initial.frame.cells[0].symbol = "$".into();
-        state.set_pane_surface(initial);
-        state
-            .compose(COLS, ROWS)
-            .expect("initial populated surface");
-        state.handle_input_bytes(b"a");
-        echo(&mut state, "$ a");
-        state.handle_input_bytes(b"b");
-        assert_eq!(state.input_prediction.has_pending(), prediction);
-        state
-    }
-
     fn patches(state: &ClientShellState, count: u64) -> Vec<crate::protocol::PaneSurfacePatch> {
         let surface = state.pane_surface.as_ref().expect("populated surface");
         (0..count)
@@ -772,7 +701,7 @@ fn remote_prediction_render_scale_profile() {
         for prediction in [false, true] {
             let mut samples = Vec::new();
             for _ in 0..SAMPLES {
-                let mut state = populated_shell(pane_count, prediction);
+                let mut state = populated_remote_prediction_shell(pane_count, prediction);
                 let mut encoder = BlitEncoder::new();
                 let initial = state
                     .compose(COLS, ROWS)
@@ -806,4 +735,79 @@ fn remote_prediction_render_scale_profile() {
         results[1][0] / results[0][0], results[1][0] - results[0][0],
         results[1][1] / results[0][1], results[1][1] - results[0][1]
     );
+}
+
+pub(super) fn populated_remote_prediction_shell(
+    pane_count: usize,
+    prediction: bool,
+) -> ClientShellState {
+    const COLS: u16 = 120;
+    const ROWS: u16 = 48;
+    let mut config = Config::default();
+    config.remote.predict_input = prediction;
+    let mut state = ClientShellState::new(ClientShellConfig::from_config(&config));
+    state.primary_remote = true;
+    let mut snapshot = snapshot();
+    for index in 1..pane_count {
+        let mut pane = snapshot.panes[0].clone();
+        pane.pane_id = format!("pane_{}", index + 1);
+        pane.focused = false;
+        snapshot.panes.push(pane);
+    }
+    state.set_snapshot(Box::new(snapshot));
+    let size = state.surface_size(COLS, ROWS);
+    assert!(usize::from(size.rows) >= pane_count * 2);
+    let mut initial = surface();
+    let pane_template = initial.panes[0].clone();
+    initial.panes = (0..pane_count)
+        .map(|index| {
+            let y = (usize::from(size.rows) * index / pane_count) as u16;
+            let bottom = (usize::from(size.rows) * (index + 1) / pane_count) as u16;
+            let mut pane = pane_template.clone();
+            pane.pane_id = format!("pane_{}", index + 1);
+            pane.focused = index == 0;
+            pane.rect = SurfaceRect {
+                x: 0,
+                y,
+                width: size.cols,
+                height: bottom - y,
+            };
+            pane.inner_rect = pane.rect;
+            pane
+        })
+        .collect();
+    initial.frame = FrameData::from_ratatui_buffer(
+        &Buffer::empty(Rect::new(0, 0, size.cols, size.rows)),
+        Some(crate::protocol::CursorState {
+            x: 2,
+            y: 0,
+            visible: true,
+            shape: 2,
+        }),
+    );
+    for (index, pane) in initial.panes.iter().enumerate() {
+        for y in pane.inner_rect.y..pane.inner_rect.y + pane.inner_rect.height {
+            let text = format!(
+                "pane {:02} row {y:02}: populated terminal output ",
+                index + 1
+            );
+            for x in 0..size.cols {
+                initial.frame.cells[usize::from(y) * usize::from(size.cols) + usize::from(x)]
+                    .symbol = char::from(text.as_bytes()[usize::from(x) % text.len()]).to_string();
+            }
+        }
+    }
+    for cell in &mut initial.frame.cells[..usize::from(size.cols)] {
+        cell.symbol = " ".into();
+    }
+    initial.frame.cells[0].symbol = "$".into();
+    state.set_pane_surface(initial);
+    state
+        .compose(COLS, ROWS)
+        .expect("initial populated surface");
+    state.handle_input_bytes(b"a");
+    echo(&mut state, "$ a");
+    state.handle_input_bytes(b"b");
+    assert_eq!(state.input_prediction.has_pending(), prediction);
+    state
 }
