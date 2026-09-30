@@ -144,6 +144,7 @@ impl ClientShellState {
         }
         if endpoint_id == &self.active_endpoint_id && status != ClientEndpointStatus::Online {
             self.pending_workspace_highlight = None;
+            self.input_prediction.clear();
         }
         if let Some(endpoint) = self
             .endpoints
@@ -230,6 +231,7 @@ impl ClientShellState {
         let switching_endpoint = endpoint_id != &self.active_endpoint_id;
         let agent_scroll = self.agent_scroll;
         if switching_endpoint {
+            self.input_prediction.clear();
             self.active_endpoint_id = endpoint_id.clone();
             self.pane_surface = None;
             self.pending_pane_surface = None;
@@ -459,6 +461,17 @@ impl ClientShellState {
             .iter()
             .find(|endpoint| &endpoint.endpoint_id == endpoint_id)
             .map_or("Unknown endpoint", |endpoint| endpoint.label.as_str())
+    }
+
+    pub(crate) fn set_primary_endpoint_label(&mut self, label: &str) {
+        self.primary_remote = true;
+        if let Some(endpoint) = self
+            .endpoints
+            .iter_mut()
+            .find(|endpoint| endpoint.endpoint_id.is_local())
+        {
+            endpoint.label = label.to_owned();
+        }
     }
 
     pub(crate) fn active_endpoint_label(&self) -> &str {

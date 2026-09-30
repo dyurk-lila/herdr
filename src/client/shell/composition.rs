@@ -152,6 +152,14 @@ impl ClientShellState {
         cols: u16,
         rows: u16,
     ) -> Option<crate::client::frame_output::ComposedFrame> {
+        // Keep pending cells only while the same input context remains eligible.
+        if !self.prediction_context_allowed()
+            || self
+                .last_composed_size
+                .is_some_and(|size| size != (cols, rows))
+        {
+            self.input_prediction.clear();
+        }
         self.last_composed_at = Some(std::time::Instant::now());
         self.selection_repaint_deadline = None;
         if self.last_composed_size != Some((cols, rows)) && self.mode == ClientShellMode::Navigate {
@@ -344,6 +352,8 @@ impl ClientShellState {
             frame.cells[start..start + usize::from(bar.width)].to_vec()
         });
         blit_pane_surface(&mut frame, &surface.frame, layout.pane_surface);
+        self.input_prediction
+            .apply(&mut frame, (layout.pane_surface.x, layout.pane_surface.y));
         restore_mode_bar(&mut frame, mode_bar, mode_bar_cells.as_deref());
         let mut occlusion = crate::kitty_graphics::surface::Occlusion::default();
         let has_selection = self

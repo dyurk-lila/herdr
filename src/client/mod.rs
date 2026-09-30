@@ -474,6 +474,9 @@ async fn run_client_loop(
     if let Some(shell) = state.shell.as_mut() {
         shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
         shell.set_endpoint_catalog(&endpoint_catalog.ssh);
+        if is_remote_client {
+            shell.set_primary_endpoint_label("Remote");
+        }
         shell.set_endpoint_methods_for(
             &endpoint::ClientEndpointId::Local,
             initial
@@ -617,12 +620,27 @@ async fn run_client_loop(
     };
     let mut supervisors =
         endpoint::EndpointSupervisors::new(&endpoint_catalog.ssh, std::time::Instant::now());
-    if federated {
+    // A --remote client uses the primary endpoint's local SSH bridge socket. The bridge
+    // accepts another connection after SSH exits, so the existing supervisor can recover
+    // it without replaying input or restarting the remote panes. Older generation-1 servers
+    // remain attachable; coherent recovery requires their optional surface/fence support.
+    let primary_remote_recovery = is_remote_client
+        && state.shell.is_some()
+        && write_stream
+            .connection(&endpoint::ClientEndpointId::Local)
+            .is_some_and(|connection| connection.negotiation.supports_surface_interest());
+    if federated || primary_remote_recovery {
         supervisors.add_local(
             client_socket_path(),
             write_stream
                 .connection(&endpoint::ClientEndpointId::Local)
                 .map(|connection| connection.generation),
+            std::time::Instant::now(),
+        );
+    }
+    if primary_remote_recovery {
+        write_stream.enable_remote_health(
+            &endpoint::ClientEndpointId::Local,
             std::time::Instant::now(),
         );
     }
@@ -1313,6 +1331,9 @@ async fn run_client_loop(
                         negotiation,
                         false,
                     );
+                    if primary_remote_recovery && endpoint_id.is_local() {
+                        write_stream.enable_remote_health(&endpoint_id, now);
+                    }
                     if let Some(frame) = frame {
                         state.present_frame(frame);
                     }
@@ -1338,8 +1359,10 @@ async fn run_client_loop(
                 if !endpoint_catalog.select_endpoint(&endpoint_id) {
                     continue;
                 }
-                if let Err(error) = endpoint_catalog.store_selection() {
-                    warn!(%error, "failed to persist desired endpoint selection");
+                if !is_remote_client {
+                    if let Err(error) = endpoint_catalog.store_selection() {
+                        warn!(%error, "failed to persist desired endpoint selection");
+                    }
                 }
                 begin_endpoint_activation(
                     &mut state,
@@ -2176,7 +2199,7 @@ async fn run_client_loop(
                         error = %failure.message,
                         "endpoint transport failed"
                     );
-                    if !federated && failure.endpoint_id.is_local() {
+                    if !federated && !primary_remote_recovery && failure.endpoint_id.is_local() {
                         return Err(ClientError::ConnectionLost(io::Error::new(
                             failure.kind,
                             failure.message,
@@ -2250,7 +2273,8 @@ async fn run_client_loop(
                         outcome.repaint |= notification_repaint
                             | shell.tick_copy_feedback(now)
                             | shell.tick_workspace_highlight(now)
-                            | shell.tick_endpoint_error(now);
+                            | shell.tick_endpoint_error(now)
+                            | shell.tick_prediction(now);
                         let frame = outcome
                             .repaint
                             .then(|| shell.compose(state.reported_size.0, state.reported_size.1))
