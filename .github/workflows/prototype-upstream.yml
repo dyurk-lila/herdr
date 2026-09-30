@@ -1,0 +1,137 @@
+name: Update prototype from stable Herdr
+
+on:
+  workflow_dispatch:
+  schedule:
+    - cron: '23 14 * * 1'
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: prototype-upstream
+  cancel-in-progress: false
+
+jobs:
+  update:
+    if: github.repository == 'dyurk-lila/herdr'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    env:
+      GH_TOKEN: ${{ github.token }}
+      UPSTREAM_REPOSITORY: herdrdev/herdr
+      PROTOTYPE_BRANCH: dyurk/remote-input-proto
+      GIT_AUTHOR_NAME: Dominic Yurk
+      GIT_AUTHOR_EMAIL: dyurk@lila.ai
+      GIT_COMMITTER_NAME: Dominic Yurk
+      GIT_COMMITTER_EMAIL: dyurk@lila.ai
+    steps:
+      - name: Checkout prototype
+        uses: actions/checkout@df4cb1c069e1874edd31b4311f1884172cec0e10 # v6
+        with:
+          ref: ${{ env.PROTOTYPE_BRANCH }}
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Prepare stable update and pull request
+        shell: bash
+        run: |
+          set -euo pipefail
+          gh auth setup-git
+          git config user.name "$GIT_AUTHOR_NAME"
+          git config user.email "$GIT_AUTHOR_EMAIL"
+          base_commit="$(git rev-parse HEAD)"
+          release="$(gh api "repos/$UPSTREAM_REPOSITORY/releases/latest")"
+          if ! jq -e '.draft == false and .prerelease == false' <<< "$release" >/dev/null; then
+            echo '::error::Upstream latest release is not a published stable release.'
+            exit 1
+          fi
+          tag="$(jq -r .tag_name <<< "$release")"
+          release_id="$(jq -r .id <<< "$release")"
+          if [[ ! "$tag" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo '::error::Unexpected upstream stable release tag.'
+            exit 1
+          fi
+          tag_object="$(gh api "repos/$UPSTREAM_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)"
+          release_commit="$(gh api "repos/$UPSTREAM_REPOSITORY/commits/$tag" --jq .sha)"
+          if [[ ! "$tag_object" =~ ^[0-9a-f]{40}$ || ! "$release_commit" =~ ^[0-9a-f]{40}$ ]]; then
+            echo '::error::Upstream release did not resolve to valid Git objects.'
+            exit 1
+          fi
+          release_ref=refs/prototype-upstream/release
+          git fetch --no-tags "https://github.com/$UPSTREAM_REPOSITORY.git" \
+            "refs/tags/$tag:$release_ref"
+          if [[ "$(git rev-parse "$release_ref")" != "$tag_object" || \
+                "$(git rev-parse "$release_ref^{commit}")" != "$release_commit" ]]; then
+            echo '::error::Fetched release tag or commit differs from the upstream API.'
+            exit 1
+          fi
+          {
+            echo '## Stable Herdr update'
+            printf 'Release: %s\n\nCommit: %s\n\n' "$tag" "$release_commit"
+          } >> "$GITHUB_STEP_SUMMARY"
+          if git merge-base --is-ancestor "$release_commit" "$base_commit"; then
+            echo 'The prototype already includes this release.' >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
+
+          update_branch="prototype/update-$tag"
+          remote_head="$(git ls-remote --heads origin "refs/heads/$update_branch")"
+          if [[ -n "$remote_head" ]]; then
+            git fetch --no-tags origin \
+              "refs/heads/$update_branch:refs/remotes/origin/$update_branch"
+            git checkout -b "$update_branch" "refs/remotes/origin/$update_branch"
+          else
+            git checkout -b "$update_branch" "$base_commit"
+          fi
+          merge_or_stop() {
+            if ! git merge --no-ff "$1" -m "$2"; then
+              {
+                echo '### Merge stopped; nothing was pushed'
+                echo 'Resolve this update manually and rerun the workflow. Conflicting paths:'
+                echo '```text'
+                git diff --name-only --diff-filter=U
+                echo '```'
+              } >> "$GITHUB_STEP_SUMMARY"
+              git merge --abort
+              echo '::error::Stable update requires manual merge resolution.'
+              exit 1
+            fi
+          }
+          merge_or_stop "$base_commit" 'chore: refresh prototype update base'
+          merge_or_stop "$release_commit" "chore: update prototype to $tag"
+          git diff --check "$base_commit"...HEAD
+
+          # Refuse stale inputs instead of publishing an update against moving refs.
+          current_release="$(gh api "repos/$UPSTREAM_REPOSITORY/releases/latest")"
+          current_base="$(git ls-remote --exit-code origin "refs/heads/$PROTOTYPE_BRANCH" | cut -f1)"
+          current_tag="$(gh api "repos/$UPSTREAM_REPOSITORY/git/ref/tags/$tag" --jq .object.sha)"
+          if [[ "$(jq -r .id <<< "$current_release")" != "$release_id" || \
+                "$(jq -r .tag_name <<< "$current_release")" != "$tag" || \
+                "$current_tag" != "$tag_object" || "$current_base" != "$base_commit" ]]; then
+            echo 'Release or prototype branch changed during this run; rerun the workflow.' >> "$GITHUB_STEP_SUMMARY"
+            echo '::error::Update inputs changed; nothing was pushed.'
+            exit 1
+          fi
+          git push origin "HEAD:refs/heads/$update_branch"
+          pr_number="$(gh pr list --repo "$GITHUB_REPOSITORY" --state open \
+            --base "$PROTOTYPE_BRANCH" --head "$update_branch" --json number --jq '.[0].number // empty')"
+          body_file="$RUNNER_TEMP/prototype-update-pr.md"
+          cat > "$body_file" <<EOF
+          Merge stable Herdr $tag ($release_commit) into the remote-input prototype.
+
+          This branch preserves the prototype changes and passed the merge and whitespace checks. Review the diff and approve any pending CI runs before merging; this workflow does not build or publish binaries or merge the PR.
+
+          Upstream release: https://github.com/$UPSTREAM_REPOSITORY/releases/tag/$tag
+          Maintenance: docs/prototype-maintenance.md
+          EOF
+          if [[ -n "$pr_number" ]]; then
+            gh pr edit "$pr_number" --repo "$GITHUB_REPOSITORY" \
+              --title "chore: update prototype to $tag" --body-file "$body_file"
+            pr_url="$(gh pr view "$pr_number" --repo "$GITHUB_REPOSITORY" --json url --jq .url)"
+          else
+            pr_url="$(gh pr create --repo "$GITHUB_REPOSITORY" --base "$PROTOTYPE_BRANCH" \
+              --head "$update_branch" --title "chore: update prototype to $tag" --body-file "$body_file")"
+          fi
+          printf 'Review update: %s\n' "$pr_url" >> "$GITHUB_STEP_SUMMARY"

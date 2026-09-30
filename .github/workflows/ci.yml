@@ -1,10 +1,11 @@
 name: CI
 
 on:
+  workflow_dispatch:
   pull_request:
     types: [opened, synchronize, reopened]
   push:
-    branches: [master, windows]
+    branches: [master, windows, dyurk/remote-input-proto]
 
 permissions:
   contents: read
