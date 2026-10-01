@@ -459,7 +459,7 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
                     raise RuntimeError("Changed editor did not advertise copy-recovery controls")
             os.write(client.master, b"K")
             expected += "K"
-            case["held_online_edit"] = wait_restored(client, remote, session, pane, expected, agent, cursor_at_end=False)
+            case["held_online_edit"] = wait_restored(client, remote, session, pane, expected, agent)
             if enabled:
                 case["held_suffix_unchanged"] = exact_held_suffix(client, offline_suffix)
                 if not case["held_suffix_unchanged"]:

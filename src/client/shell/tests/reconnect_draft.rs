@@ -660,7 +660,14 @@ fn held_changed_editor_keeps_copy_recovery_without_owning_online_typing() {
     echo(&mut state, "› changed");
     reconnect(&mut state);
     assert!(state.take_reconnect_draft_input().is_none());
-    state.compose(80, 24).unwrap();
+    let drafts = std::mem::take(&mut state.reconnect_drafts);
+    let canonical_cursor = state.compose(80, 24).unwrap().frame.cursor;
+    state.reconnect_drafts = drafts;
+    assert_eq!(
+        state.compose(80, 24).unwrap().frame.cursor,
+        canonical_cursor,
+        "the healthy agent owns the cursor while recovery remains visible"
+    );
     assert!(state.has_reconnect_draft());
     assert_eq!(state.handle_input_bytes(b"K").requests.len(), 1);
     assert_eq!(

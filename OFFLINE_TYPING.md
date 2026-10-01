@@ -52,7 +52,7 @@ prediction learning.
 
 Changed/unknown context, unresolved pre-drop input and unsupported editor
 baselines stay in the panel with **Copy** and **Discard**. While fully online,
-this recovery panel does not capture ordinary typing from the agent editor. A replaced pane exposes its
+this recovery panel does not capture ordinary typing or move the agent cursor. A replaced pane exposes its
 original draft on the same machine for manual recovery; it never retargets input.
 Switching machines keeps drafts with their original endpoint. Drafts are bounded
 to 16 targets and 64 KiB of retained text per target, with visible limit notices.

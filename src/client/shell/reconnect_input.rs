@@ -468,6 +468,11 @@ impl ClientShellState {
             view.editor,
             style.add_modifier(Modifier::UNDERLINED),
         );
+        let cursor = if self.reconnect_input_ready && view.reason != DraftReason::Ready {
+            frame.cursor.clone()
+        } else {
+            cursor
+        };
         frame.replace_from_ratatui_buffer_preserving_effects(&buffer, cursor);
         self.reconnect_panel_underlay = Some(ReconnectPanelUnderlay {
             area,
