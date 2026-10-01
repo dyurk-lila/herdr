@@ -1,7 +1,8 @@
 # Continuous typing across temporary disconnects
 
 The prototype implements a **client-local reconnect draft**, without UDP, a new
-SSH bridge, or a modified remote server. Enable both settings:
+SSH bridge, or a modified remote server. Enable buffering; inline prediction is
+an independent option:
 
 ```toml
 [remote]
@@ -20,69 +21,60 @@ existing text editor. Movement and deletion apply only to the new, never-sent
 suffix. Enter, interrupts and unsupported controls are consumed with a notice;
 they are never queued. Client prefix and direct shortcuts retain priority.
 
-Once activation commits, best-effort recovery requires a recognized Claude/Codex
-input row with no unconfirmed online input, the same endpoint, pane, server boot,
-agent, geometry, terminal modes, full original cells and cursor. Delivery
-confidence survives client-only prefix, focus and prediction resets; cold
-prediction alone does not block an otherwise clean editor. An unchanged picture
-is a heuristic, not an application-supported prompt epoch.
+Once activation commits and remote pane input is available, all scratchpad text
+is handed to the remote pane's normal input queue. Prediction training, prior
+unconfirmed input, changed editor contents, agent readiness labels and exact
+screen echoes do not gate this transfer. There are no Copy/Discard controls or
+manual recovery mode. The scratchpad disappears immediately after a successful
+queue admission, and normal agent input and cursor rendering resume. An open
+server terminal popup temporarily defers pane input; closing it automatically
+flushes the waiting scratchpad.
 
-A new control-free Unicode suffix is inserted once at that cursor, including
-wide/combining text or text that will wrap. A locally moved middle cursor is
-restored with ordered Left events. The existing editor baseline must still have
-safe, recognized single-row bounds; an already wrapped or ambiguous editor stays
-manual. This canonical handoff does not imply inline prediction of wide text or
-application-specific wrapping.
+Control-free Unicode text can transfer even when it is too wide or long for
+inline prediction. A locally moved middle cursor is restored with ordered Left
+events after the text. If restoring the cursor would require more than 4,095
+Left events, all text still transfers but the caret stays at the end, avoiding
+the stable server's event-batch limit. This does not imply prediction of
+application-specific Unicode cursor movement or wrapping. Failed queue admission
+leaves the unsent scratchpad available for the next ready connection. Accepted
+scratchpad text is removed, never retained as a receipt, and never replayed on a
+later disconnect; that outage starts a new scratchpad containing only newly typed
+text.
 
-Each suffix is marked attempted **before** transport enqueue and attempted only
-once. Successful enqueue immediately hides the draft panel and restores normal
-agent keyboard routing, without a click or waiting for echo. A failed enqueue
-keeps recovery visible. Exact projected text/cursor echo in the same connection
-generation retires the retained receipt and may restore prediction confidence.
-Later online input cannot be acknowledged or overwritten by that older echo.
-
-A second drop before confirmation, a changed generation, or three seconds
-without exact confirmation preserves the receipt as uncertain and prevents
-automatic resend. Unconfirmed receipts remain hidden while online and reappear
-on a later drop. Wide/wrapped handoffs have no exact inline echo projection, so
-that later recovery remains manual until Copy/Discard; continuing online is
-unblocked. Copy recovery composes later offline edits at the attempted cursor,
-including middle insertion. A hidden caret painted over text needs fresh
-prediction learning.
-
-Changed/unknown context, unresolved pre-drop input and unsupported editor
-baselines stay in the panel with **Copy** and **Discard**. While fully online,
-this recovery panel does not capture ordinary typing or move the agent cursor. A replaced pane exposes its
-original draft on the same machine for manual recovery; it never retargets input.
-Switching machines keeps drafts with their original endpoint. Drafts are bounded
-to 16 targets and 64 KiB of retained text per target, with visible limit notices.
-Delivery confidence also tracks at most 16 unresolved targets; overflow keeps
-automatic recovery conservative until client restart. Drafts live only in
-client memory and disappear when that client exits. They are
-never written to shared learning profiles or diagnostics by the feature.
+Drafts remain associated with their original endpoint. The original visible pane
+is preferred; if it is gone or no longer viewed, handoff uses the focused visible
+pane on that same endpoint. Switching machines does not move scratchpad text
+between destinations. They are bounded to 16 targets and 64 KiB per target, with
+visible limit notices. Scratchpads live
+only in client memory and disappear when the client exits. They are never
+written to shared learning profiles or diagnostics by this feature.
 
 ## Limits and maintenance contract
 
-This supports ordinary detected outages with best-effort automatic continuation.
-It cannot preserve input sent between the actual drop and its detection, prove
-that identical screen pixels mean the same application prompt, or determine
-whether an uncertain attempt reached the remote editor. Copying uncertain text
-may include text already present remotely. Keeping the online predictor alive
-would not resolve these delivery ambiguities.
+This is best-effort automatic continuation during detected outages. Queue
+admission means the local connection accepted the request, not that the remote
+editor applied it. A later failure can lose accepted text; the client does not
+retry it and risk duplicate insertion. Input sent between the actual drop and
+its detection remains subject to the normal connection's delivery limits.
 
-Keep remote pane-input leases and presentation gates intact. The draft is local
-UI, not an exception to offline transport fencing. Frozen generation-one codecs
-and stable remote binaries remain unchanged.
+Text goes to the current editor in the target pane even when its contents,
+application or prompt changed during the outage. Screen pixels cannot establish
+application prompt identity. Enter and other controls remain unqueued, so the
+scratchpad never submits a model prompt automatically.
 
-`reconnect_draft.rs` owns the pure bounded editor/attempt model;
-`reconnect_delivery.rs` retains bounded delivery confidence independently of
-prediction resets; `reconnect_input.rs` routes local input, renders recovery, and creates guarded
-one-shot requests. `tests/reconnect_draft.rs` protects partial activation,
-changed/replaced panes, uncertain online input, local controls and retained
-rendering. Pure model tests cover second drops before echo, limits, full-cell
-context and composed recovery. Run `scripts/remote_reconnect_draft_smoke.py
---help` for disposable native Claude/Codex outage comparisons. Keep its raw
-artifacts private and never submit model prompts.
+Keep remote pane-input leases and presentation gates intact. The scratchpad is
+local UI, not an exception to offline transport fencing. Frozen generation-one
+codecs and stable remote binaries remain unchanged.
+
+`reconnect_draft.rs` owns the pure bounded scratchpad editor;
+`reconnect_input.rs` captures local input, renders the panel and creates the
+one-shot request after committed readiness. `tests/reconnect_draft.rs` protects
+partial activation, changed editors, unconfirmed earlier input, local controls,
+failed enqueue and retained rendering. Pure model tests cover bounded editing,
+cursor positioning and removal of accepted text. Run
+`scripts/remote_reconnect_draft_smoke.py --help` for disposable native
+Claude/Codex outage comparisons, including Unicode across a second loss. Keep
+its raw artifacts private and never submit model prompts.
 
 ## Future resumable delivery capability
 

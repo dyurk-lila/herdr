@@ -22,7 +22,7 @@ updates, including updates that merge cleanly.
 | Agent changes | Activity/readiness labels, including unknown, are advisory. Do not depend on pinned CLI versions, internal editor APIs or daemon readiness RPCs. New layouts require evidence; contradictory echoes invalidate shared learning, including contradictions arriving after visible expiry, then permit relearning. |
 | Shared persistence | Store only destination/prompt hashes, agent labels and bounded behavior rules. Preserve private permissions, atomic replacement, cross-client locking and bounded background work. Epochs fence stale observations; concurrent invalidations must both survive. Overflow pauses reuse until a newer reset is observed. Corrupt/unknown schemas remain untrained; an incompatible schema needs an explicit migration or reset. |
 | Performance | Keep prediction state pure and the cached rendering path free of filesystem I/O, waits and per-render hashing. Preserve hidden-pane/retained-render exits. Changes to pane-scaled work require fixed-geometry measurements with one and at least 15 populated panes. |
-| Reconnect drafts | Keep opt-in client-local capture through committed activation, Unicode-aware never-sent suffix editing, full-cell context fencing and one attempted delivery per suffix. Changed/replaced contexts remain copyable. Preserve attempted/new text separation, middle-cursor copy composition, 16-target/64-KiB bounds, visible limits and volatile storage. Canonical enqueue hides the panel immediately and restores agent input; failed enqueue keeps recovery visible. Delivery confidence survives client-only prediction resets, and older receipt echoes never acknowledge later input. New wide/wrapped suffixes can hand off once without inline projection; their uncertain receipts stay hidden online and require manual recovery on a later drop. Held online recovery does not own ordinary keyboard input or the visible agent cursor. Exact confirmed recovery may rearm a known caret for the next outage; unknown painted carets need fresh learning. A second drop before confirmation or missing exact echo must never authorize replay. Enter/controls stay unqueued; prefix shortcuts and remote input/presentation leases remain intact. |
+| Reconnect drafts | Keep opt-in client-local capture through committed activation, Unicode-aware never-sent suffix editing, 16-target/64-KiB bounds, visible limits and volatile storage. Once pane input is ready, transfer all scratchpad text through the canonical input queue independently of prediction training, previous unconfirmed input, changed editor contents or agent readiness. Successful queue admission removes the scratchpad immediately and restores normal agent input and cursor; failed admission retains unsent text. A server terminal popup defers pane input until closing it automatically flushes the scratchpad. No Copy/Discard, manual recovery or retained attempted receipts. Never replay accepted text on a later drop. Preserve endpoint isolation; prefer the original visible pane, otherwise the focused visible pane on that endpoint. Preserve ordered middle-cursor Left events up to 4,095; larger restoration transfers all text with the caret at end to respect the stable event-batch limit. Wide/wrapped text can transfer without inline projection. Enter/controls stay unqueued; prefix shortcuts and remote input/presentation leases remain intact. Queue admission is not authoritative delivery acknowledgement. |
 | Compatibility and isolation | Keep opt-in prediction and separate `herdr-proto` config/state/catalog/socket paths, including direct and saved-machine routing. Keep stable remote interoperability and connection recovery. Do not change frozen generation-one codecs, enum variants, fixtures or method meanings to make new features pass. |
 
 Reliable resumable delivery is **not** part of this contract. Client-local
@@ -46,12 +46,13 @@ those server guarantees. Do not silently enable replay against an older server.
   Unicode, mixed clicks/edits, first-character warmth, late contradictions and
   changed word semantics followed by relearning. Profile/store tests protect
   concurrent invalidation, stale refresh, overflow and corruption behavior.
-- `reconnect_draft.rs`, `reconnect_delivery.rs`, `reconnect_input.rs` and
-  `tests/reconnect_draft.rs`:
-  local capture through partial activation, immutable attempted batches, exact
-  context/echo fences, cursor-aware recovery, bounded editing and retained-patch
-  occlusion. Run `scripts/remote_reconnect_draft_smoke.py` against unchanged
-  stable servers with both current agents, comparing disabled/enabled drafts.
+- `reconnect_draft.rs`, `reconnect_input.rs` and `tests/reconnect_draft.rs`:
+  local capture through partial activation, bounded scratchpad editing,
+  one-shot queue admission, cursor-aware handoff, failed enqueue and retained-patch
+  occlusion. Test changed editors and previous unconfirmed input without holding
+  the panel, plus a second outage after wide Unicode without accepted-text replay.
+  Run `scripts/remote_reconnect_draft_smoke.py` against unchanged stable servers
+  with both current agents, comparing disabled/enabled scratchpads.
 - Existing frozen endpoint codec/digest/method fixtures and client reconnect tests
   remain compatibility tests; never rewrite their expectations to bless drift.
 
@@ -140,7 +141,7 @@ list --json` and `herdr machine list --json` remain separate after each upstream
 merge. Keep remote test sessions distinct too; local isolation does not split
 a shared remote session. `[remote].predict_input = true` enables prediction;
 it remains opt-in. `[remote].buffer_reconnect_input = true` separately enables
-local outage drafts with guarded, one-shot recovery; it adds no reliable replay
+local outage scratchpads with automatic one-shot handoff; it adds no reliable replay
 or server acknowledgement protocol.
 
 ## Remote Codex startup troubleshooting

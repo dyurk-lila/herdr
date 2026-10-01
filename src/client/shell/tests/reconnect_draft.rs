@@ -1,7 +1,6 @@
 use super::prediction::{echo, remote_shell};
 use super::*;
-use crate::client::shell::reconnect_draft::{DraftReason, DraftTarget};
-use std::time::{Duration, Instant};
+use crate::client::shell::reconnect_draft::DraftTarget;
 
 fn target() -> DraftTarget {
     DraftTarget {
@@ -48,157 +47,11 @@ fn reconnect(state: &mut ClientShellState) {
 }
 
 #[test]
-fn reconnect_draft_captures_and_edits_locally_through_presentation_sync() {
-    let mut state = editor();
-    let authoritative = state.pane_surface.clone().unwrap();
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    assert_eq!(
-        state.reconnect_drafts.view(&target()).unwrap().reason,
-        DraftReason::Ready
-    );
-    assert!(state
-        .handle_input_bytes(b"mnop\x1b[D\x1b[D\x7f")
-        .requests
-        .is_empty());
-    assert!(state.handle_input_bytes("é".as_bytes()).requests.is_empty());
-    assert!(state
-        .handle_input_bytes(b"\x1b[C\x1b[3~\x1b[Fz")
-        .requests
-        .is_empty());
-    assert_eq!(state.reconnect_drafts.copy_text(&target()).unwrap(), "méoz");
-    assert_eq!(state.pane_surface.as_ref().unwrap(), &authoritative);
-    state.set_endpoint_status(&ClientEndpointId::Local, ClientEndpointStatus::Online);
-    assert!(
-        state.take_reconnect_draft_input().is_none(),
-        "Online is not committed input readiness"
-    );
-    assert!(state.handle_input_bytes(b"K").requests.is_empty());
-    let frame = state.compose(80, 24).unwrap().frame;
-    assert!(frame_rows(&frame)
-        .iter()
-        .any(|row| row.contains("Reconnect draft")));
-    assert!(frame.cursor.as_ref().unwrap().visible);
-    reconnect(&mut state);
-    let request = state.take_reconnect_draft_input().unwrap();
-    assert_eq!(
-        request,
-        ClientMessage::ClientShellPaneInput {
-            pane_id: "pane_1".into(),
-            events: vec![ClientPaneInputEvent::TextCommit("méozK".into())]
-        }
-    );
-    assert!(state.take_reconnect_draft_input().is_none());
-    echo(&mut state, "› améozK");
-    assert!(state.reconnect_drafts.view(&target()).is_none());
-    assert_eq!(state.handle_input_bytes(b"Q").requests.len(), 1);
-}
-
-#[test]
-fn reconnect_draft_second_drop_keeps_attempted_and_new_text_without_retry() {
-    let mut state = editor();
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    state.handle_input_bytes(b"one");
-    reconnect(&mut state);
-    state.take_reconnect_draft_input().unwrap();
-    state.set_reconnect_input_ready(false);
-    state.handle_input_bytes(b"two");
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    assert_eq!(
-        state.reconnect_drafts.copy_text(&target()).unwrap(),
-        "onetwo"
-    );
-    reconnect(&mut state);
-    assert!(state.take_reconnect_draft_input().is_none());
-    assert_eq!(
-        state.reconnect_drafts.view(&target()).unwrap().reason,
-        DraftReason::UncertainDelivery
-    );
-}
-
-#[test]
-fn reconnect_draft_changed_editor_and_uncertain_online_input_require_recovery() {
-    for uncertain in [false, true] {
-        let mut state = editor();
-        if uncertain {
-            state.handle_input_bytes(b"in-flight");
-        }
-        state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-        state.handle_input_bytes(b"offline");
-        if !uncertain {
-            echo(&mut state, "› changed");
-        }
-        reconnect(&mut state);
-        assert!(state.take_reconnect_draft_input().is_none());
-        assert_eq!(
-            state.reconnect_drafts.copy_text(&target()).unwrap(),
-            "offline"
-        );
-    }
-}
-
-#[test]
-fn reconnect_draft_does_not_queue_enter_or_steal_prefix_and_keeps_copy_recovery() {
-    let mut state = editor();
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    state.handle_input_bytes(b"offline\r");
-    assert_eq!(
-        state.reconnect_drafts.copy_text(&target()).unwrap(),
-        "offline"
-    );
-    state.handle_input_bytes(b"\x02");
-    assert_eq!(state.mode, ClientShellMode::Prefix);
-    state.handle_input_bytes(b"\x1b");
-    state.compose(80, 24).unwrap();
-    let copy = state.hits.reconnect_copy;
-    let copied =
-        state.handle_raw_events(vec![crate::raw_input::RawInputEvent::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: copy.x,
-            row: copy.y,
-            modifiers: KeyModifiers::NONE,
-        })]);
-    assert!(
-        matches!(copied.actions.as_slice(),[ClientShellAction::ClipboardWrite(bytes)] if bytes == b"offline")
-    );
-    assert!(state.reconnect_drafts.view(&target()).is_some());
-}
-
-#[test]
-fn reconnect_draft_replaced_pane_remains_copyable_without_sending_to_replacement() {
-    let mut state = editor();
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    state.handle_input_bytes(b"recover-me");
-    let mut replacement = snapshot();
-    replacement.panes[0].pane_id = "replacement".into();
-    replacement.focused_pane_id = Some("replacement".into());
-    state.set_snapshot(Box::new(replacement));
-    reconnect(&mut state);
-    assert!(state.take_reconnect_draft_input().is_none());
-    let frame = state.compose(80, 24).unwrap().frame;
-    assert!(frame_rows(&frame)
-        .iter()
-        .any(|row| row.contains("copy to recover")));
-    let copy = state.hits.reconnect_copy;
-    let outcome =
-        state.handle_raw_events(vec![crate::raw_input::RawInputEvent::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(MouseButton::Left),
-            column: copy.x,
-            row: copy.y,
-            modifiers: KeyModifiers::NONE,
-        })]);
-    assert!(
-        matches!(outcome.actions.as_slice(), [ClientShellAction::ClipboardWrite(text)] if text == b"recover-me")
-    );
-    assert!(outcome.requests.is_empty());
-}
-
-#[test]
 fn reconnect_draft_panel_covers_remote_mouse_routing_and_retained_patches() {
     let mut state = editor();
     state.mark_endpoint_disconnected(&ClientEndpointId::Local);
     state.handle_input_bytes(b"draft");
     reconnect(&mut state);
-    state.reconnect_drafts.hold(&target());
     state.compose(80, 24).unwrap();
     let panel = state.hits.reconnect_panel;
     let clicked =
@@ -304,7 +157,7 @@ fn reconnect_draft_projects_only_local_edits_over_last_presented_frozen_surface(
 }
 
 #[test]
-fn reconnect_draft_frozen_repaints_restore_underlay_on_hide_move_and_discard() {
+fn reconnect_draft_frozen_repaints_restore_underlay_on_hide_move_and_delivery() {
     let mut client = crate::client::ClientState::test_new();
     client.shell = Some(editor());
     let shell = client.shell.as_mut().unwrap();
@@ -345,7 +198,7 @@ fn reconnect_draft_frozen_repaints_restore_underlay_on_hide_move_and_discard() {
         .as_ref()
         .unwrap()
         .hits
-        .reconnect_copy
+        .reconnect_panel
         .is_empty());
     client.shell.as_mut().unwrap().mode = ClientShellMode::Terminal;
     let shell = client.shell.as_mut().unwrap();
@@ -370,11 +223,7 @@ fn reconnect_draft_frozen_repaints_restore_underlay_on_hide_move_and_discard() {
     let restored = client.frozen_reconnect_draft_frame().unwrap();
     assert_eq!(restored, clean);
     let hits = &client.shell.as_ref().unwrap().hits;
-    assert!(
-        hits.reconnect_panel.is_empty()
-            && hits.reconnect_copy.is_empty()
-            && hits.reconnect_discard.is_empty()
-    );
+    assert!(hits.reconnect_panel.is_empty());
     assert!(client.presentation_frozen);
     client.unfreeze_presentation();
     assert!(client.frozen_reconnect_base.is_none());
@@ -445,239 +294,101 @@ fn reconnect_draft_underlay_restores_original_link_targets_after_table_remapping
 }
 
 #[test]
-fn reconnect_draft_settled_recovery_stays_trained_for_next_loss_without_healthy_keys() {
+fn scratchpad_waits_for_committed_readiness_then_flushes_all_edited_text() {
     let mut state = editor();
+    let authoritative = state.pane_surface.clone().unwrap();
     state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    state.handle_input_bytes(b"first");
-    reconnect(&mut state);
-    state.take_reconnect_draft_input().unwrap();
-    echo(&mut state, "› afirst");
-    assert!(state.reconnect_drafts.view(&target()).is_none());
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    assert_eq!(
-        state.reconnect_drafts.view(&target()).unwrap().reason,
-        DraftReason::Ready
-    );
-    state.handle_input_bytes("λnext".as_bytes());
-    reconnect(&mut state);
-    assert!(
-        matches!(state.take_reconnect_draft_input(), Some(ClientMessage::ClientShellPaneInput { events,.. }) if events == vec![ClientPaneInputEvent::TextCommit("λnext".into())])
-    );
+    assert!(state
+        .handle_input_bytes(b"mnop\x1b[D\x1b[D\x7f")
+        .requests
+        .is_empty());
+    state.handle_input_bytes("é".as_bytes());
+    state.handle_input_bytes(b"\x1b[C\x1b[3~\x1b[Fz");
+    assert_eq!(state.reconnect_drafts.copy_text(&target()).unwrap(), "méoz");
+    assert_eq!(state.pane_surface.as_ref().unwrap(), &authoritative);
+    state.set_endpoint_status(&ClientEndpointId::Local, ClientEndpointStatus::Online);
     assert!(state.take_reconnect_draft_input().is_none());
-    echo(&mut state, "› afirstλnext");
-    assert!(state.reconnect_drafts.view(&target()).is_none());
-}
-
-#[test]
-fn reconnect_draft_confirmation_restores_exact_middle_cursor_bounds_for_online_edits() {
-    let mut state = editor();
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    state.handle_input_bytes(b"abc\x1b[D");
+    assert!(state.handle_input_bytes(b"K").requests.is_empty());
     reconnect(&mut state);
-    state.take_reconnect_draft_input().unwrap();
-    echo(&mut state, "› aabc");
-    let mut observed = state.pane_surface.clone().unwrap();
-    observed.frame.cursor.as_mut().unwrap().x -= 1;
-    observed.surface_revision += 1;
-    state.set_pane_surface(observed);
-    assert!(state.reconnect_drafts.view(&target()).is_none());
-    let typed = state.handle_input_bytes(b"x");
-    assert_eq!(typed.requests.len(), 1);
-    assert!(state.input_prediction.has_pending());
-    let frame = state.compose(80, 24).unwrap().frame;
-    assert!(frame_rows(&frame).iter().any(|row| row.contains("› aabxc")));
-    // A loss before this ordinary key's echo remains manual/uncertain.
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    let input = state.take_reconnect_draft_input().unwrap();
     assert_eq!(
-        state.reconnect_drafts.view(&target()).unwrap().reason,
-        DraftReason::ManualRecovery
-    );
-}
-
-#[test]
-fn reconnect_draft_confirmation_rearms_only_identifiable_software_carets() {
-    for (cursor_x, confirmed) in [(3, false), (5, true)] {
-        let mut state = editor();
-        echo(&mut state, "› abc");
-        let mut observed = state.pane_surface.clone().unwrap();
-        let cursor = observed.frame.cursor.as_mut().unwrap();
-        cursor.visible = false;
-        cursor.x = cursor_x;
-        observed.frame.cells[usize::from(cursor_x)].fg = 0x02_00_00_00;
-        observed.frame.cells[usize::from(cursor_x)].bg = 0x02_ff_ff_ff;
-        observed.surface_revision += 1;
-        state.set_pane_surface(observed);
-        let anchor = state
-            .input_prediction
-            .reconnect_anchor(
-                state.pane_surface.as_ref().unwrap(),
-                "pane_1",
-                crate::detect::Agent::Codex,
-            )
-            .unwrap()
-            .0;
-        state
-            .input_prediction
-            .adopt_reconnect_echo("pane_1", &anchor);
-        assert_eq!(
-            state
-                .input_prediction
-                .reconnect_anchor(
-                    state.pane_surface.as_ref().unwrap(),
-                    "pane_1",
-                    crate::detect::Agent::Codex,
-                )
-                .unwrap()
-                .1,
-            confirmed
-        );
-        if !confirmed {
-            let before = state.compose(80, 24).unwrap().frame;
-            assert!(!state
-                .handle_input_bytes(b"\x1b[D\x1b[3~")
-                .requests
-                .is_empty());
-            assert!(!state.input_prediction.has_pending());
-            assert_eq!(state.compose(80, 24).unwrap().frame, before);
+        input.request,
+        ClientMessage::ClientShellPaneInput {
+            pane_id: target().pane_id,
+            events: vec![ClientPaneInputEvent::TextCommit("méozK".into())]
         }
-        state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-        assert_eq!(
-            state.reconnect_drafts.view(&target()).unwrap().reason,
-            if confirmed {
-                DraftReason::Ready
-            } else {
-                DraftReason::ManualRecovery
-            }
-        );
-    }
-}
-
-#[test]
-fn reconnect_handoff_survives_client_only_prediction_reset() {
-    let mut state = editor();
-    assert!(state.reconnect_delivery.is_clean(&target()));
-    assert!(state.handle_input_bytes(b"\x02").requests.is_empty());
-    assert_eq!(state.mode, ClientShellMode::Prefix);
-    assert!(state.handle_input_bytes(b"\x1b").requests.is_empty());
-    assert_eq!(state.mode, ClientShellMode::Terminal);
-    assert!(state.reconnect_delivery.is_clean(&target()));
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    state.handle_input_bytes(b"offline");
-    reconnect(&mut state);
-    let request = state.take_reconnect_draft_input().unwrap();
-    assert!(state.commit_reconnect_draft_handoff(&request));
-    assert!(!state.has_reconnect_draft());
+    );
+    assert!(
+        state.has_reconnect_draft(),
+        "prepare does not imply acceptance"
+    );
+    state.commit_reconnect_draft_handoff(&input);
+    assert!(state.reconnect_drafts.view(&target()).is_none());
     let frame = state.compose(80, 24).unwrap().frame;
     assert!(!frame_rows(&frame)
         .iter()
         .any(|row| row.contains("Reconnect draft")));
     assert!(state.hits.reconnect_panel.is_empty());
-    assert_eq!(state.handle_input_bytes(b"K").requests.len(), 1);
+    assert_eq!(state.handle_input_bytes(b"Q").requests.len(), 1);
 }
 
 #[test]
-fn reconnect_handoff_does_not_require_first_character_training() {
+fn scratchpad_always_transfers_with_unconfirmed_changed_or_unrecognized_editor() {
+    for variant in 0..4 {
+        let mut state = editor();
+        match variant {
+            0 => {
+                state.handle_input_bytes(b"in-flight");
+            }
+            1 => {
+                state.handle_input_bytes(b"\x02\x1b");
+            }
+            2 => {
+                state.config.remote_predict_input = false;
+            }
+            _ => {}
+        }
+        state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+        state.handle_input_bytes("界🧪λoffline".as_bytes());
+        if variant == 3 {
+            let mut projection = snapshot();
+            projection.agents.clear();
+            state.set_snapshot(Box::new(projection));
+            echo(&mut state, "totally different editor");
+        } else {
+            echo(&mut state, "› changed");
+        }
+        reconnect(&mut state);
+        let input = state.take_reconnect_draft_input().unwrap();
+        assert!(
+            matches!(&input.request, ClientMessage::ClientShellPaneInput { events, .. }
+            if events == &vec![ClientPaneInputEvent::TextCommit("界🧪λoffline".into())])
+        );
+        state.commit_reconnect_draft_handoff(&input);
+        assert!(!state.has_reconnect_draft());
+    }
+}
+
+#[test]
+fn scratchpad_accepted_text_never_returns_on_later_loss_without_echo() {
     let mut state = editor();
-    state.input_prediction.clear();
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    assert_eq!(
-        state.reconnect_drafts.view(&target()).unwrap().reason,
-        DraftReason::Ready
-    );
-    state.handle_input_bytes("界🧪λ".as_bytes());
-    reconnect(&mut state);
-    let request = state.take_reconnect_draft_input().unwrap();
-    assert!(
-        matches!(&request, ClientMessage::ClientShellPaneInput { events, .. }
-        if events == &vec![ClientPaneInputEvent::TextCommit("界🧪λ".into())])
-    );
-    state.commit_reconnect_draft_handoff(&request);
-    assert!(!state.has_reconnect_draft());
-    state.tick_prediction(Instant::now() + Duration::from_secs(4));
-    assert!(
-        !state.has_reconnect_draft(),
-        "timeout does not steal the healthy editor"
-    );
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    assert!(state.has_reconnect_draft());
-    assert_eq!(
-        state.reconnect_drafts.view(&target()).unwrap().reason,
-        DraftReason::UncertainDelivery
-    );
-    reconnect(&mut state);
-    assert!(state.take_reconnect_draft_input().is_none());
+    for text in ["界first", "λsecond", "third"] {
+        state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+        assert_eq!(state.reconnect_drafts.copy_text(&target()).unwrap(), "");
+        state.handle_input_bytes(text.as_bytes());
+        reconnect(&mut state);
+        let input = state.take_reconnect_draft_input().unwrap();
+        assert!(
+            matches!(&input.request, ClientMessage::ClientShellPaneInput {events,..}
+            if events == &vec![ClientPaneInputEvent::TextCommit(text.into())])
+        );
+        assert!(state.commit_reconnect_draft_handoff(&input));
+        assert!(state.take_reconnect_draft_input().is_none());
+    }
 }
 
 #[test]
-fn client_only_reset_never_erases_unconfirmed_remote_input() {
-    let mut state = editor();
-    state.handle_input_bytes(b"in-flight");
-    assert!(!state.reconnect_delivery.is_clean(&target()));
-    state.handle_input_bytes(b"\x02\x1b");
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    state.handle_input_bytes(b"offline");
-    reconnect(&mut state);
-    assert!(state.take_reconnect_draft_input().is_none());
-    assert_eq!(
-        state.reconnect_drafts.view(&target()).unwrap().reason,
-        DraftReason::ManualRecovery
-    );
-    assert_eq!(state.handle_input_bytes(b"K").requests.len(), 1);
-    assert_eq!(
-        state.reconnect_drafts.copy_text(&target()).unwrap(),
-        "offline"
-    );
-}
-
-#[test]
-fn old_handoff_echo_does_not_confirm_subsequent_remote_typing() {
-    let mut state = editor();
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    state.handle_input_bytes(b"offline");
-    reconnect(&mut state);
-    let request = state.take_reconnect_draft_input().unwrap();
-    state.commit_reconnect_draft_handoff(&request);
-    assert_eq!(state.handle_input_bytes(b"K").requests.len(), 1);
-    assert!(state.reconnect_drafts.had_intervening_input(&target()));
-    echo(&mut state, "› aoffline");
-    assert!(state.reconnect_drafts.view(&target()).is_none());
-    assert!(!state.reconnect_delivery.is_clean(&target()));
-    assert!(state.input_prediction.has_unconfirmed_input());
-    echo(&mut state, "› aofflineK");
-    assert!(state.reconnect_delivery.is_clean(&target()));
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    assert_eq!(
-        state.reconnect_drafts.view(&target()).unwrap().reason,
-        DraftReason::Ready
-    );
-}
-
-#[test]
-fn held_changed_editor_keeps_copy_recovery_without_owning_online_typing() {
-    let mut state = editor();
-    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-    state.handle_input_bytes(b"offline");
-    echo(&mut state, "› changed");
-    reconnect(&mut state);
-    assert!(state.take_reconnect_draft_input().is_none());
-    let drafts = std::mem::take(&mut state.reconnect_drafts);
-    let canonical_cursor = state.compose(80, 24).unwrap().frame.cursor;
-    state.reconnect_drafts = drafts;
-    assert_eq!(
-        state.compose(80, 24).unwrap().frame.cursor,
-        canonical_cursor,
-        "the healthy agent owns the cursor while recovery remains visible"
-    );
-    assert!(state.has_reconnect_draft());
-    assert_eq!(state.handle_input_bytes(b"K").requests.len(), 1);
-    assert_eq!(
-        state.reconnect_drafts.copy_text(&target()).unwrap(),
-        "offline"
-    );
-}
-
-#[test]
-fn reconnect_handoff_failed_enqueue_preserves_the_visible_one_shot_receipt() {
+fn scratchpad_failed_enqueue_retries_and_clears_only_after_success() {
     use crate::client::endpoint::{EndpointNegotiation, EndpointRegistry, EndpointTransport};
     struct Transport(bool);
     impl EndpointTransport for Transport {
@@ -692,36 +403,253 @@ fn reconnect_handoff_failed_enqueue_preserves_the_visible_one_shot_receipt() {
             }
         }
     }
+    let mut state = editor();
+    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    state.handle_input_bytes(b"offline");
+    reconnect(&mut state);
     for success in [false, true] {
-        let mut state = editor();
-        state.mark_endpoint_disconnected(&ClientEndpointId::Local);
-        state.handle_input_bytes(b"offline");
-        reconnect(&mut state);
-        let request = state.take_reconnect_draft_input().unwrap();
+        let input = state.take_reconnect_draft_input().unwrap();
         let mut endpoints = EndpointRegistry::new(
             Transport(success),
             1,
             EndpointNegotiation::new(Vec::new(), Vec::new()),
         );
         assert_eq!(
-            crate::client::shell_runtime::send_reconnect_draft(
-                &mut endpoints,
-                &mut state,
-                &request
-            ),
+            crate::client::shell_runtime::send_reconnect_draft(&mut endpoints, &mut state, &input),
             success
         );
         assert_eq!(state.has_reconnect_draft(), !success);
+        if !success {
+            state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+            reconnect(&mut state);
+            assert_eq!(
+                state.reconnect_drafts.copy_text(&target()).unwrap(),
+                "offline"
+            );
+        }
+    }
+    assert!(state.take_reconnect_draft_input().is_none());
+}
+
+#[test]
+fn scratchpad_empty_editor_removal_repaints_the_presented_frame() {
+    use crate::client::endpoint::{EndpointNegotiation, EndpointRegistry, EndpointTransport};
+    struct Transport;
+    impl EndpointTransport for Transport {
+        fn send(&mut self, _: &ClientMessage) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+    let mut shell = editor();
+    shell.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    shell.handle_input_bytes(b"x");
+    reconnect(&mut shell);
+    let outcome = shell.handle_input_bytes(b"\x7f");
+    let frame = shell.compose(80, 24).unwrap();
+    assert!(frame_rows(&frame.frame)
+        .iter()
+        .any(|row| row.contains("Reconnect draft")));
+    let mut state = crate::client::ClientState::test_new();
+    state.reported_size = (80, 24);
+    state.shell = Some(shell);
+    // The loop-top readiness refresh must leave removal to the runtime repaint path.
+    state
+        .shell
+        .as_mut()
+        .unwrap()
+        .set_reconnect_input_ready(true);
+    assert!(state.shell.as_ref().unwrap().has_reconnect_draft());
+    let mut endpoints = EndpointRegistry::new(
+        Transport,
+        1,
+        EndpointNegotiation::new(Vec::new(), Vec::new()),
+    );
+    crate::client::shell_runtime::finish_client_shell_input(
+        &mut state,
+        outcome,
+        Some(frame),
+        &mut endpoints,
+        &mut None,
+        &mut crate::client::endpoint_commands::EndpointCommands::default(),
+        &mut crate::platform::RealPrefixInputSource::default(),
+        &mut None,
+    )
+    .unwrap();
+    assert!(!state.shell.as_ref().unwrap().has_reconnect_draft());
+    assert!(!frame_rows(state.blit_encoder.current_frame().unwrap())
+        .iter()
+        .any(|row| row.contains("Reconnect draft")));
+}
+
+#[test]
+fn scratchpad_waits_for_popup_pane_input_to_be_available_then_transfers() {
+    for popup_kind in 0..3 {
+        let mut state = editor();
+        state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+        state.handle_input_bytes(b"offline");
+        reconnect(&mut state);
+        match popup_kind {
+            0 => state.popup_terminal_id = Some("popup".into()),
+            1 => state.popup_pending = true,
+            _ => {
+                state.pane_surface.as_mut().unwrap().popup =
+                    Some(Box::new(crate::protocol::ClientShellPopupSurface {
+                        terminal_id: "popup".into(),
+                        title: String::new(),
+                        width: None,
+                        height: None,
+                        frame: state.pane_surface.as_ref().unwrap().frame.clone(),
+                        mouse_reporting: false,
+                        sgr_pixel_mouse: false,
+                        pixel_width: 0,
+                        pixel_height: 0,
+                    }))
+            }
+        }
+        assert!(state.take_reconnect_draft_input().is_none());
         assert_eq!(
             state.reconnect_drafts.copy_text(&target()).unwrap(),
             "offline"
         );
-        assert!(state.take_reconnect_draft_input().is_none());
+        state.popup_terminal_id = None;
+        state.popup_pending = false;
+        state.pane_surface.as_mut().unwrap().popup = None;
+        let input = state.take_reconnect_draft_input().unwrap();
+        assert!(
+            matches!(&input.request, ClientMessage::ClientShellPaneInput { events, .. }
+            if events == &vec![ClientPaneInputEvent::TextCommit("offline".into())])
+        );
+        assert!(state.commit_reconnect_draft_handoff(&input));
+        assert!(!state.has_reconnect_draft());
     }
 }
 
 #[test]
-fn reconnect_full_budget_middle_cursor_does_not_truncate_left_repeat_count() {
+fn scratchpad_has_no_recovery_buttons_and_never_queues_enter() {
+    let mut state = editor();
+    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    state.handle_input_bytes(b"offline\r");
+    let frame = state.compose(80, 24).unwrap().frame;
+    let rows = frame_rows(&frame);
+    assert!(rows.iter().any(|row| row.contains("Reconnect draft")));
+    assert!(!rows.iter().any(|row| row.contains("[Copy]")
+        || row.contains("[Discard]")
+        || row.contains("copy to recover")));
+    state.handle_input_bytes(b"\x02");
+    assert_eq!(state.mode, ClientShellMode::Prefix);
+    state.handle_input_bytes(b"\x1b");
+    reconnect(&mut state);
+    let input = state.take_reconnect_draft_input().unwrap();
+    assert!(
+        matches!(input.request, ClientMessage::ClientShellPaneInput {events,..}
+        if events == vec![ClientPaneInputEvent::TextCommit("offline".into())])
+    );
+}
+
+#[test]
+fn scratchpad_toggle_off_stops_new_capture_without_stranding_existing_text() {
+    let mut state = editor();
+    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    state.handle_input_bytes(b"offline");
+    state.config.remote_buffer_reconnect_input = false;
+    assert!(state.handle_input_bytes(b"K").requests.is_empty());
+    reconnect(&mut state);
+    let input = state.take_reconnect_draft_input().unwrap();
+    assert!(
+        matches!(&input.request, ClientMessage::ClientShellPaneInput {events,..}
+        if events == &vec![ClientPaneInputEvent::TextCommit("offlineK".into())])
+    );
+    state.commit_reconnect_draft_handoff(&input);
+    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    assert!(!state.has_reconnect_draft());
+}
+
+#[test]
+fn scratchpad_retargets_missing_or_nonviewed_pane_on_same_endpoint_and_removes_source() {
+    for removed in [true, false] {
+        let mut state = editor();
+        state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+        state.handle_input_bytes(b"offline");
+        let mut projection = snapshot();
+        let mut replacement = projection.panes[0].clone();
+        replacement.pane_id = "replacement".into();
+        if removed {
+            projection.panes.clear();
+        }
+        projection.panes.push(replacement);
+        projection.focused_pane_id = Some("replacement".into());
+        state.set_snapshot(Box::new(projection));
+        let mut visible = state.pane_surface.clone().unwrap();
+        visible.panes[0].pane_id = "replacement".into();
+        state.set_pane_surface(visible);
+        reconnect(&mut state);
+        let input = state.take_reconnect_draft_input().unwrap();
+        assert!(
+            matches!(&input.request, ClientMessage::ClientShellPaneInput {pane_id,..} if pane_id == "replacement")
+        );
+        assert!(state.commit_reconnect_draft_handoff(&input));
+        assert!(state.reconnect_drafts.view(&target()).is_none());
+        assert!(!state.has_reconnect_draft());
+    }
+}
+
+#[test]
+fn scratchpad_stays_with_original_machine_and_multiple_entries_drain() {
+    let mut state = editor();
+    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    state.handle_input_bytes(b"first");
+    let second = DraftTarget {
+        endpoint_id: ClientEndpointId::Local,
+        pane_id: "other-tab-pane".into(),
+    };
+    state.reconnect_drafts.begin(&second);
+    state.reconnect_drafts.edit(
+        &second,
+        &crate::raw_input::RawInputEvent::Paste("second".into()),
+    );
+    let other = ClientEndpointId::Ssh(
+        crate::client::endpoint::ProfileId::parse("11111111111111111111111111111111").unwrap(),
+    );
+    state.active_endpoint_id = other.clone();
+    state.set_endpoint_status(&other, ClientEndpointStatus::Online);
+    state.set_reconnect_input_ready(true);
+    assert!(state.take_reconnect_draft_input().is_none());
+    state.active_endpoint_id = ClientEndpointId::Local;
+    reconnect(&mut state);
+    for text in ["first", "second"] {
+        let input = state.take_reconnect_draft_input().unwrap();
+        assert!(
+            matches!(&input.request, ClientMessage::ClientShellPaneInput {events,..}
+            if events == &vec![ClientPaneInputEvent::TextCommit(text.into())])
+        );
+        state.commit_reconnect_draft_handoff(&input);
+    }
+    assert!(state.take_reconnect_draft_input().is_none());
+}
+
+#[test]
+fn scratchpad_middle_cursor_is_restored_within_server_batch_limit() {
+    let mut state = editor();
+    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    state.handle_input_bytes(b"abc\x1b[D");
+    reconnect(&mut state);
+    let input = state.take_reconnect_draft_input().unwrap();
+    let ClientMessage::ClientShellPaneInput { events, .. } = input.request else {
+        panic!("pane input")
+    };
+    assert!(matches!(&events[0], ClientPaneInputEvent::TextCommit(text) if text == "abc"));
+    assert!(matches!(
+        &events[1],
+        ClientPaneInputEvent::Key {
+            code: crate::protocol::ClientKeyCode::Left,
+            repeat_count: 1,
+            ..
+        }
+    ));
+}
+
+#[test]
+fn scratchpad_full_budget_home_preserves_text_without_exceeding_server_event_limit() {
     let mut state = editor();
     state.mark_endpoint_disconnected(&ClientEndpointId::Local);
     state.handle_raw_events(vec![crate::raw_input::RawInputEvent::Paste(
@@ -729,26 +657,18 @@ fn reconnect_full_budget_middle_cursor_does_not_truncate_left_repeat_count() {
     )]);
     state.handle_input_bytes(b"\x1b[H");
     reconnect(&mut state);
-    let ClientMessage::ClientShellPaneInput { events, .. } =
-        state.take_reconnect_draft_input().unwrap()
-    else {
-        panic!("canonical pane handoff");
+    let input = state.take_reconnect_draft_input().unwrap();
+    let ClientMessage::ClientShellPaneInput { events, .. } = &input.request else {
+        panic!("pane input")
     };
     assert!(
         matches!(&events[0], ClientPaneInputEvent::TextCommit(text) if text.len() == 64 * 1024)
     );
     assert_eq!(
-        events[1..]
-            .iter()
-            .map(|event| match event {
-                ClientPaneInputEvent::Key {
-                    code: crate::protocol::ClientKeyCode::Left,
-                    repeat_count,
-                    ..
-                } => usize::from(*repeat_count),
-                _ => panic!("ordered Left event"),
-            })
-            .sum::<usize>(),
-        64 * 1024
+        events.len(),
+        1,
+        "huge cursor movement must not reject the entire text batch"
     );
+    assert!(state.commit_reconnect_draft_handoff(&input));
+    assert!(!state.has_reconnect_draft());
 }

@@ -121,28 +121,6 @@ impl ClientShellState {
         event: &ClientPaneInputEvent,
         outcome: &mut ClientShellInput,
     ) {
-        if let ClientInputTarget::Pane(pane_id) = target {
-            if (self.primary_remote || !self.active_endpoint_id.is_local())
-                && !matches!(
-                    event,
-                    ClientPaneInputEvent::Key {
-                        kind: crate::protocol::ClientKeyKind::Release,
-                        ..
-                    } | ClientPaneInputEvent::Mouse {
-                        kind: crate::protocol::ClientMouseKind::Up(_)
-                            | crate::protocol::ClientMouseKind::Moved,
-                        ..
-                    }
-                )
-            {
-                let target = super::reconnect_draft::DraftTarget {
-                    endpoint_id: self.active_endpoint_id.clone(),
-                    pane_id: pane_id.clone(),
-                };
-                self.reconnect_delivery.sent(&target);
-                self.reconnect_drafts.mark_intervening_input(&target);
-            }
-        }
         if !self.prediction_allowed() {
             outcome.repaint |= self.input_prediction.clear();
             return;
@@ -162,7 +140,6 @@ impl ClientShellState {
     }
 
     pub(super) fn reconcile_prediction(&mut self) {
-        self.observe_reconnect_draft();
         if !self.prediction_allowed() {
             self.input_prediction.clear();
         } else if let Some(surface) = self.pane_surface.as_ref() {
@@ -170,28 +147,15 @@ impl ClientShellState {
             self.input_prediction
                 .select_machine(&self.active_endpoint_id);
             self.input_prediction.set_agent_context(agent);
-            let unconfirmed = self.input_prediction.has_unconfirmed_input();
             self.input_prediction.observe(surface, Instant::now());
-            if unconfirmed {
-                if let Some(pane_id) = self.focused_pane_id() {
-                    if self.input_prediction.confirmed_row(surface, &pane_id) {
-                        self.reconnect_delivery
-                            .confirmed(&super::reconnect_draft::DraftTarget {
-                                endpoint_id: self.active_endpoint_id.clone(),
-                                pane_id,
-                            });
-                    }
-                }
-            }
         }
     }
 
     pub(crate) fn tick_prediction(&mut self, now: Instant) -> bool {
-        let draft_repaint = self.reconnect_drafts.tick(now);
         if !self.prediction_context_allowed() {
-            self.input_prediction.clear() | draft_repaint
+            self.input_prediction.clear()
         } else {
-            self.input_prediction.expire(now) | draft_repaint
+            self.input_prediction.expire(now)
         }
     }
 }

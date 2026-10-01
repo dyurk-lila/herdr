@@ -1,9 +1,14 @@
 //! Client-owned outage drafts; remote input leases and authoritative frames stay unchanged.
-use super::reconnect_draft::{DraftNotice, DraftReason, DraftTarget};
+use super::reconnect_draft::{DraftNotice, DraftTarget};
 use super::*;
 use crate::raw_input::RawInputEvent;
-use crossterm::event::{KeyEventKind, MouseButton, MouseEventKind};
+use crossterm::event::KeyEventKind;
 use std::time::Instant;
+
+pub(crate) struct ReconnectDraftInput {
+    target: DraftTarget,
+    pub(crate) request: ClientMessage,
+}
 
 pub(crate) struct ReconnectPanelUnderlay {
     area: Rect,
@@ -70,20 +75,12 @@ impl ClientShellState {
 
     pub(super) fn reconnect_display_target(&self) -> Option<DraftTarget> {
         if let Some(target) = self.reconnect_target() {
-            if self
-                .reconnect_drafts
-                .view(&target)
-                .is_some_and(|view| !view.handed_off)
-            {
+            if self.reconnect_drafts.view(&target).is_some() {
                 return Some(target);
             }
         }
         self.reconnect_drafts
-            .recovery_target(&self.active_endpoint_id, |pane_id| {
-                self.snapshot.as_ref().is_some_and(|snapshot| {
-                    snapshot.panes.iter().any(|pane| pane.pane_id == pane_id)
-                })
-            })
+            .target_for_endpoint(&self.active_endpoint_id)
             .cloned()
     }
 
@@ -95,17 +92,6 @@ impl ClientShellState {
             .iter()
             .find(|agent| agent.pane_id == pane_id)?;
         crate::detect::parse_agent_label(agent.agent.as_deref()?)
-    }
-
-    fn reconnect_anchor(
-        &self,
-        target: &DraftTarget,
-    ) -> Option<(reconnect_draft::DraftAnchor, bool)> {
-        self.input_prediction.reconnect_anchor(
-            self.pane_surface.as_ref()?,
-            &target.pane_id,
-            self.reconnect_agent(&target.pane_id)?,
-        )
     }
 
     pub(super) fn begin_reconnect_draft(&mut self) {
@@ -121,96 +107,61 @@ impl ClientShellState {
         let Some(target) = self.reconnect_target() else {
             return;
         };
-        let anchor = self.reconnect_anchor(&target);
-        let allow_auto = anchor.is_some() && self.reconnect_delivery.is_clean(&target);
-        self.reconnect_drafts.disconnect(&target);
-        if !self
-            .reconnect_drafts
-            .begin(&target, anchor.map(|(anchor, _)| anchor), allow_auto)
-        {
-            self.set_endpoint_error("Reconnect draft limit reached; discard an older draft");
+        if !self.reconnect_drafts.begin(&target) {
+            self.set_endpoint_error("Reconnect scratchpad target limit reached");
         }
         self.reconnect_input_ready = false;
     }
 
     pub(crate) fn set_reconnect_input_ready(&mut self, ready: bool) {
         self.reconnect_input_ready = ready;
-        if ready {
-            if let Some(target) = self.reconnect_target() {
-                if self.reconnect_drafts.view(&target).is_some_and(|view| {
-                    view.editor.is_empty() && view.attempted.is_none() && view.uncertain.is_none()
-                }) {
-                    self.reconnect_drafts.discard(&target);
-                }
-            }
-            if let Some(target) = self.reconnect_display_target() {
-                if self.reconnect_target().as_ref() != Some(&target) {
-                    self.reconnect_drafts.hold(&target);
-                }
-            }
-            self.observe_reconnect_draft();
-        }
     }
 
-    pub(crate) fn block_reconnect_draft_recovery(&mut self) {
-        if let Some(target) = self.reconnect_target() {
-            self.reconnect_drafts.hold(&target);
-        }
+    pub(crate) fn remove_empty_reconnect_drafts(&mut self) -> bool {
+        self.reconnect_drafts.remove_empty(&self.active_endpoint_id)
     }
 
-    pub(super) fn observe_reconnect_draft(&mut self) {
+    pub(crate) fn take_reconnect_draft_input(&mut self) -> Option<ReconnectDraftInput> {
         if !self.reconnect_input_ready
-            || self.pending_pane_surface.is_some()
-            || self.pane_surface_generation != self.active_snapshot_generation
-        {
-            return;
-        }
-        let (Some(target), Some(generation)) =
-            (self.reconnect_target(), self.active_snapshot_generation)
-        else {
-            return;
-        };
-        if let Some((anchor, _)) = self.reconnect_anchor(&target) {
-            let awaiting_echo = self
-                .reconnect_drafts
-                .view(&target)
-                .is_some_and(|view| view.reason == DraftReason::AwaitingEcho);
-            let intervening = self.reconnect_drafts.had_intervening_input(&target);
-            let changed =
-                self.reconnect_drafts
-                    .observe(&target, &anchor, generation, Instant::now());
-            let confirmed = awaiting_echo
-                && changed
-                && self
-                    .reconnect_drafts
-                    .view(&target)
-                    .is_none_or(|view| view.reason == DraftReason::Ready);
-            if confirmed && !intervening {
-                self.reconnect_delivery.confirmed(&target);
-                self.input_prediction
-                    .adopt_reconnect_echo(&target.pane_id, &anchor);
-            }
-        }
-    }
-
-    pub(crate) fn take_reconnect_draft_input(&mut self) -> Option<ClientMessage> {
-        if !self.config.remote_buffer_reconnect_input
-            || !self.reconnect_input_ready
+            || self.active_snapshot_generation.is_none()
             || self.pending_pane_surface.is_some()
             || self.pane_surface_generation != self.active_snapshot_generation
             || self.overlay.is_some()
             || self.mode != ClientShellMode::Terminal
+            || self.popup_terminal_id.is_some()
+            || self.popup_pending
+            || self
+                .pane_surface
+                .as_ref()
+                .is_some_and(|surface| surface.popup.is_some())
         {
             return None;
         }
-        let target = self.reconnect_target()?;
-        let (anchor, _) = self.reconnect_anchor(&target)?;
-        let generation = self.active_snapshot_generation?;
-        let attempt =
-            self.reconnect_drafts
-                .attempt(&target, &anchor, generation, Instant::now())?;
+        let target = self.reconnect_display_target()?;
+        let surface = self.pane_surface.as_ref()?;
+        let pane_id = if surface
+            .panes
+            .iter()
+            .any(|pane| pane.pane_id == target.pane_id)
+        {
+            target.pane_id.clone()
+        } else {
+            let focused = self.focused_pane_id()?;
+            surface
+                .panes
+                .iter()
+                .any(|pane| pane.pane_id == focused)
+                .then_some(focused)?
+        };
+        let attempt = self.reconnect_drafts.attempt(&target)?;
         let mut events = vec![ClientPaneInputEvent::TextCommit(attempt.text)];
-        let mut trailing_left = attempt.trailing_left;
+        // Large cursor restoration must not overflow the stable server's event batch.
+        // The full text still transfers; exceptionally large movements leave the caret at end.
+        let mut trailing_left = if attempt.trailing_left < crate::protocol::MAX_INPUT_EVENT_BATCH {
+            attempt.trailing_left
+        } else {
+            0
+        };
         while trailing_left > 0 {
             let repeat_count = trailing_left.min(usize::from(u16::MAX)) as u16;
             trailing_left -= usize::from(repeat_count);
@@ -226,38 +177,30 @@ impl ClientShellState {
                 windows_record: None,
             });
         }
-        self.reconnect_delivery.sent(&target);
-        if self.prediction_allowed() {
-            self.input_prediction
-                .select_machine(&self.active_endpoint_id);
-            self.input_prediction
-                .set_agent_context(self.reconnect_agent(&target.pane_id));
-            if let Some(surface) = self.pane_surface.as_ref() {
-                for event in &events {
-                    self.input_prediction.record_input(
-                        surface,
-                        &target.pane_id,
-                        event,
-                        Instant::now(),
-                    );
-                }
-            }
-        }
-        Some(ClientMessage::ClientShellPaneInput {
-            pane_id: target.pane_id,
-            events,
+        Some(ReconnectDraftInput {
+            target,
+            request: ClientMessage::ClientShellPaneInput { pane_id, events },
         })
     }
 
-    /// Hide the local editor only after canonical transport accepts its one-shot payload.
-    pub(crate) fn commit_reconnect_draft_handoff(&mut self, request: &ClientMessage) -> bool {
-        let ClientMessage::ClientShellPaneInput { pane_id, .. } = request else {
-            return false;
-        };
-        self.reconnect_drafts.mark_handed_off(&DraftTarget {
-            endpoint_id: self.active_endpoint_id.clone(),
-            pane_id: pane_id.clone(),
-        })
+    /// Enqueue acceptance permanently removes only this never-sent scratchpad.
+    pub(crate) fn commit_reconnect_draft_handoff(&mut self, input: &ReconnectDraftInput) -> bool {
+        let changed = self.reconnect_drafts.commit(&input.target);
+        if changed && self.prediction_allowed() {
+            if let ClientMessage::ClientShellPaneInput { pane_id, events } = &input.request {
+                self.input_prediction
+                    .select_machine(&self.active_endpoint_id);
+                self.input_prediction
+                    .set_agent_context(self.reconnect_agent(pane_id));
+                if let Some(surface) = self.pane_surface.as_ref() {
+                    for event in events {
+                        self.input_prediction
+                            .record_input(surface, pane_id, event, Instant::now());
+                    }
+                }
+            }
+        }
+        changed
     }
 
     pub(super) fn handle_reconnect_draft_event(
@@ -269,36 +212,11 @@ impl ClientShellState {
             return false;
         };
         if let RawInputEvent::Mouse(mouse) = event {
-            if mouse.kind == MouseEventKind::Down(MouseButton::Left) && mouse.modifiers.is_empty() {
-                let point = (mouse.column, mouse.row);
-                if contains(self.hits.reconnect_copy, point) {
-                    if let Some(text) = self.reconnect_drafts.copy_text(&target) {
-                        outcome
-                            .actions
-                            .push(ClientShellAction::ClipboardWrite(text.into_bytes()));
-                    }
-                    outcome.repaint = true;
-                    return true;
-                }
-                if contains(self.hits.reconnect_discard, point) {
-                    outcome.repaint |= self.reconnect_drafts.discard(&target);
-                    return true;
-                }
-            }
             if contains(self.hits.reconnect_panel, (mouse.column, mouse.row)) {
                 return true;
             }
         }
-        if self.reconnect_input_ready
-            && self
-                .reconnect_drafts
-                .view(&target)
-                .is_some_and(|view| view.reason != DraftReason::Ready)
-        {
-            return false;
-        }
-        if !self.config.remote_buffer_reconnect_input
-            || self.mode != ClientShellMode::Terminal
+        if self.mode != ClientShellMode::Terminal
             || self.overlay.is_some()
             || self.copy_mode.is_some()
             || self.selection.is_some()
@@ -327,8 +245,6 @@ impl ClientShellState {
     pub(crate) fn project_reconnect_draft(&mut self, source: &FrameData) -> Option<FrameData> {
         self.reconnect_panel_underlay = None;
         self.hits.reconnect_panel = Rect::default();
-        self.hits.reconnect_copy = Rect::default();
-        self.hits.reconnect_discard = Rect::default();
         self.reconnect_display_target()?;
         if self.mode != ClientShellMode::Terminal || self.overlay.is_some() {
             return None;
@@ -416,63 +332,23 @@ impl ClientShellState {
             }
         }
         let status = match view.notice {
-            Some(DraftNotice::UnsupportedControl) => "edit text only; copy to recover",
-            Some(DraftNotice::LimitReached) => "Draft full; copy to recover",
-            None => match view.reason {
-                DraftReason::Ready => "Queued locally",
-                DraftReason::AwaitingEcho => "Waiting for remote echo",
-                DraftReason::UncertainDelivery => "Delivery uncertain; copy to recover",
-                DraftReason::NoAnchor => "Editor not recognized; copy to recover",
-                DraftReason::ManualRecovery => "Unconfirmed input; copy to recover",
-                DraftReason::UnsupportedText => "Unsupported editor; copy to recover",
-                DraftReason::ContextChanged => "Editor changed; copy to recover",
-            },
-        };
-        let label = if self.reconnect_target().as_ref() == Some(&target) {
-            format!("Reconnect draft · {status}")
-        } else {
-            format!("Draft · copy to recover ({})", target.pane_id)
+            Some(DraftNotice::UnsupportedControl) => "Text edits only",
+            Some(DraftNotice::LimitReached) => "Scratchpad full",
+            None => "Queued locally",
         };
         buffer.set_stringn(
             area.x,
             area.y,
-            label,
-            usize::from(area.width.saturating_sub(17)),
+            format!("Reconnect draft · {status}"),
+            usize::from(area.width),
             style,
         );
-        self.hits.reconnect_copy = Rect::new(area.right() - 16, area.y, 6, 1);
-        self.hits.reconnect_discard = Rect::new(area.right() - 9, area.y, 9, 1);
-        buffer.set_string(
-            self.hits.reconnect_copy.x,
-            area.y,
-            "[Copy]",
-            style.fg(self.config.palette.blue),
-        );
-        buffer.set_string(
-            self.hits.reconnect_discard.x,
-            area.y,
-            "[Discard]",
-            style.fg(self.config.palette.blue),
-        );
-        let prefix = view.uncertain.or(view.attempted).unwrap_or("");
-        let prefix_width = UnicodeWidthStr::width(prefix).min(usize::from(area.width / 2)) as u16;
-        buffer.set_stringn(area.x, area.y + 1, prefix, usize::from(prefix_width), style);
         let cursor = text_editor::render(
             &mut buffer,
-            Rect::new(
-                area.x + prefix_width,
-                area.y + 1,
-                area.width - prefix_width,
-                1,
-            ),
+            Rect::new(area.x, area.y + 1, area.width, 1),
             view.editor,
             style.add_modifier(Modifier::UNDERLINED),
         );
-        let cursor = if self.reconnect_input_ready && view.reason != DraftReason::Ready {
-            frame.cursor.clone()
-        } else {
-            cursor
-        };
         frame.replace_from_ratatui_buffer_preserving_effects(&buffer, cursor);
         self.reconnect_panel_underlay = Some(ReconnectPanelUnderlay {
             area,

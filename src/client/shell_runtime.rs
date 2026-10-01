@@ -414,9 +414,6 @@ pub(super) fn complete_endpoint_activation(
             successor: next,
             ..
         } => {
-            if let Some(shell) = state.shell.as_mut() {
-                shell.block_reconnect_draft_recovery();
-            }
             if next.is_none() {
                 if let Some(shell) = state.shell.as_mut() {
                     shell.receive_endpoint_unavailable(error);
@@ -446,9 +443,7 @@ pub(super) fn complete_endpoint_activation(
             let ready = shell.endpoint_is_online(endpoints.active_id());
             shell.set_reconnect_input_ready(ready);
             if ready {
-                if let Some(request) = shell.take_reconnect_draft_input() {
-                    send_reconnect_draft(endpoints, shell, &request);
-                }
+                flush_reconnect_drafts(endpoints, shell);
             }
         }
     }
@@ -691,10 +686,24 @@ pub(super) fn install_client_shell_snapshot(
 pub(super) fn send_reconnect_draft(
     endpoints: &mut endpoint::EndpointRegistry,
     shell: &mut shell::ClientShellState,
-    request: &ClientMessage,
+    input: &shell::ReconnectDraftInput,
 ) -> bool {
-    endpoints.send(request) == endpoint::EndpointSendOutcome::Sent
-        && shell.commit_reconnect_draft_handoff(request)
+    endpoints.send(&input.request) == endpoint::EndpointSendOutcome::Sent
+        && shell.commit_reconnect_draft_handoff(input)
+}
+
+fn flush_reconnect_drafts(
+    endpoints: &mut endpoint::EndpointRegistry,
+    shell: &mut shell::ClientShellState,
+) -> bool {
+    let mut changed = shell.remove_empty_reconnect_drafts();
+    while let Some(input) = shell.take_reconnect_draft_input() {
+        if !send_reconnect_draft(endpoints, shell, &input) {
+            break;
+        }
+        changed = true;
+    }
+    changed
 }
 
 pub(super) fn finish_client_shell_input(
@@ -767,13 +776,8 @@ pub(super) fn finish_client_shell_input(
     let ready = active_endpoint_online && pending_activation.is_none();
     if let Some(shell) = state.shell.as_mut() {
         shell.set_reconnect_input_ready(ready);
-        if ready {
-            if let Some(request) = shell.take_reconnect_draft_input() {
-                // Marked attempted before transport enqueue; never retried automatically.
-                if send_reconnect_draft(endpoints, shell, &request) {
-                    frame = shell.compose(state.reported_size.0, state.reported_size.1);
-                }
-            }
+        if ready && flush_reconnect_drafts(endpoints, shell) {
+            frame = shell.compose(state.reported_size.0, state.reported_size.1);
         }
     }
     for request in outcome.requests {

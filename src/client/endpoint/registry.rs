@@ -7,6 +7,8 @@ use super::ClientEndpointId;
 use crate::protocol::ClientMessage;
 
 pub(crate) trait EndpointTransport: Send {
+    /// Ok accepts a complete frame; Err must leave that frame unenqueued.
+    /// Later writer errors are reported through the endpoint lifecycle.
     fn send(&mut self, message: &ClientMessage) -> io::Result<()>;
 
     fn disconnect(&mut self) {}

@@ -114,9 +114,6 @@ fn decode_endpoint_request(request: &str) -> serde_json::Result<DecodedEndpointR
         },
     )
 }
-/// Maximum structured input events accepted in one client message.
-const MAX_INPUT_EVENT_BATCH: usize = 4096;
-
 /// Channels owned by the server side of a client writer thread.
 #[derive(Clone, Debug)]
 pub(crate) struct ClientWriter {
@@ -618,7 +615,7 @@ fn classify_input_event_size(
     paste_bytes: usize,
     input_bytes: usize,
 ) -> InputEventLimit {
-    if expanded_events > MAX_INPUT_EVENT_BATCH {
+    if expanded_events > crate::protocol::MAX_INPUT_EVENT_BATCH {
         return InputEventLimit::TooManyEvents;
     }
 
@@ -1423,6 +1420,36 @@ fn client_read_loop_with_endpoint_controls(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn scratchpad_payload_and_cursor_restoration_obey_the_expanded_batch_limit() {
+        let payload = ClientPaneInputEvent::TextCommit("x".repeat(64 * 1024));
+        assert!(matches!(
+            pane_input_event_limit(std::slice::from_ref(&payload)),
+            InputEventLimit::WithinLimits
+        ));
+        for (repeat_count, accepted) in [(4095, true), (4096, false)] {
+            let cursor = ClientPaneInputEvent::Key {
+                code: crate::protocol::ClientKeyCode::Left,
+                modifiers: 0,
+                kind: crate::protocol::ClientKeyKind::Press,
+                repeat_count,
+                generated_text: None,
+                shifted_codepoint: None,
+                tracks_release: false,
+                physical_key_id: None,
+                windows_record: None,
+            };
+            assert_eq!(
+                matches!(
+                    pane_input_event_limit(&[payload.clone(), cursor]),
+                    InputEventLimit::WithinLimits
+                ),
+                accepted
+            );
+        }
+    }
+
     use interprocess::local_socket::traits::Listener as _;
     use std::path::PathBuf;
 
@@ -2412,7 +2439,7 @@ mod tests {
             position: crate::protocol::ClientMousePosition::Cell { column: 0, row: 0 },
             geometry: None,
             modifiers: 0,
-            lines: (MAX_INPUT_EVENT_BATCH + 1) as u16,
+            lines: (crate::protocol::MAX_INPUT_EVENT_BATCH + 1) as u16,
         };
         assert_eq!(
             pane_input_event_limit(&[oversized_scroll]),

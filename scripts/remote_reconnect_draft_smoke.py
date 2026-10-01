@@ -56,17 +56,6 @@ BURST = (
     + EDIT_KEYS[EditOperation.END] + b"z"
 )
 EXPECTED_FAILURES = (OSError, RuntimeError, ValueError, subprocess.SubprocessError)
-MAX_DIAGNOSTIC_RECORDS = 64
-MISMATCH_BOOL_FIELDS = (
-    "boot_changed", "agent_changed", "geometry_changed", "size_changed",
-    "modes_changed", "cursor_visibility_changed", "cursor_changed",
-    "bounds_changed", "row_length_changed",
-)
-MISMATCH_COUNT_FIELDS = (
-    "symbol_changes", "style_changes", "skip_changes", "hyperlink_changes",
-    "outside_input_changes",
-)
-LOG_FIELD = re.compile(r'(?<!\S)([a-z_]+)=(?:"([^"]*)"|([^\s]+))(?=\s|$)')
 
 
 class Scenario(StrEnum):
@@ -75,17 +64,12 @@ class Scenario(StrEnum):
     CHANGED_CONTEXT = "changed-context"
     CLIENT_RESET = "client-reset"
     WIDE_UNICODE = "wide-unicode"
+    UNCONFIRMED_INPUT = "unconfirmed-input"
 
 
 class BridgePhase(StrEnum):
     GATED = "gated"
     RELEASED = "released"
-
-
-class MismatchPhase(StrEnum):
-    ATTEMPT = "attempt"
-    OBSERVE = "observe"
-    ECHO = "echo"
 
 
 class RestoreFailure(RuntimeError):
@@ -103,49 +87,17 @@ class BridgeEvent:
     timestamp_ns: int
 
 
-def parse_reconnect_diagnostics(lines):
-    result = {"context_mismatches": [], "echo_timeouts": 0, "malformed_records": 0, "omitted_records": 0}
-    for line in lines:
-        fields = {match[1]: match[2] if match[2] is not None else match[3] for match in LOG_FIELD.finditer(line)}
-        if "event" not in fields:
-            continue
-        if fields["event"] == "reconnect.echo_timeout":
-            result["echo_timeouts"] += 1
-            continue
-        if fields["event"] == "reconnect.context_mismatch":
-            required = ("phase", *MISMATCH_BOOL_FIELDS, *MISMATCH_COUNT_FIELDS)
-            if any(name not in fields for name in required):
-                result["malformed_records"] += 1
-                continue
-            if fields["phase"] not in tuple(MismatchPhase) or any(fields[name] not in ("true", "false") for name in MISMATCH_BOOL_FIELDS) or any(re.fullmatch(r"[0-9]+", fields[name]) is None for name in MISMATCH_COUNT_FIELDS):
-                result["malformed_records"] += 1
-                continue
-            record = {"phase": fields["phase"]}
-            record.update({name: fields[name] == "true" for name in MISMATCH_BOOL_FIELDS})
-            record.update({name: int(fields[name]) for name in MISMATCH_COUNT_FIELDS})
-        else:
-            continue
-        if len(result["context_mismatches"]) >= MAX_DIAGNOSTIC_RECORDS:
-            result["context_mismatches"].pop(0)
-            result["omitted_records"] += 1
-        result["context_mismatches"].append(record)
-    return result
-
-
 def collect_reconnect_diagnostics(case_dir):
     paths = list((case_dir / "config").rglob("herdr-client.log"))
     if len(paths) > 1:
         raise RuntimeError("Expected at most one owned native-client diagnostic log")
-    if not paths:
-        return parse_reconnect_diagnostics(())
-    path = paths[0]
-    try:
-        if path.is_symlink() or path.stat().st_size > 8 * 1024 * 1024:
-            raise RuntimeError("Owned native-client diagnostic log exceeded its bounds")
-        with path.open(encoding="utf-8") as lines:
-            return parse_reconnect_diagnostics(lines)
-    finally:
-        path.unlink(missing_ok=True)
+    for path in paths:
+        try:
+            if path.is_symlink() or path.stat().st_size > 8 * 1024 * 1024:
+                raise RuntimeError("Owned native-client diagnostic log exceeded its bounds")
+        finally:
+            path.unlink(missing_ok=True)
+    return {"removed_logs": len(paths), "retained_log_content": False}
 
 
 class BridgeGate:
@@ -338,23 +290,18 @@ def panel_state(client, suffix):
     return {"present": PANEL_TITLE in screen, "queued_label_present": PANEL_QUEUED in screen, "generated_suffix_visible": suffix in screen, "copy_recovery_label_present": "copy to recover" in screen.lower(), "copy_button_visible": "[Copy]" in screen, "discard_button_visible": "[Discard]" in screen}
 
 
-def exact_held_suffix(client, suffix):
-    lines = client.screen.text().splitlines()
-    headers = [(row, line) for row, line in enumerate(lines[:-1]) if PANEL_TITLE in line and "[Discard]" in line]
-    if len(headers) != 1:
-        return False
-    row, header = headers[0]
-    start = display_width(header[:header.index(PANEL_TITLE)])
-    end = display_width(header[:header.index("[Discard]") + len("[Discard]")])
-    text = "".join(client.screen.cells[row + 1][start:end]).strip(" \u00a0")
-    return text == suffix
+def require_scratchpad_controls(client):
+    state = panel_state(client, "")
+    if any(state[field] for field in ("copy_recovery_label_present", "copy_button_visible", "discard_button_visible")):
+        raise RuntimeError("Temporary scratchpad advertised manual recovery controls")
+    return {"manual_recovery_controls_absent": True}
 
 
 def wait_panel_retired(client, started):
     remaining = started + 45 - time.monotonic()
     if remaining <= 0:
         raise RuntimeError("Reconnect handoff exceeded the shared restoration deadline")
-    client.wait_for(lambda screen: PANEL_TITLE not in screen, remaining, "automatic reconnect handoff without a copy click")
+    client.wait_for(lambda screen: PANEL_TITLE not in screen, remaining, "automatic reconnect scratchpad handoff")
     return {"panel_absent": True, "copy_clicked": False, "retirement_ms": round((time.monotonic() - started) * 1000, 2)}
 
 
@@ -366,6 +313,7 @@ def offline_burst(client, enabled, scenario):
     os.write(client.master, WIDE_SUFFIX.encode() if wide else BURST)
     if enabled:
         client.wait_for(lambda screen: PANEL_TITLE in screen and suffix in screen, 8, "local reconnect draft suffix")
+        require_scratchpad_controls(client)
     else:
         until = time.monotonic() + .4
         while time.monotonic() < until:
@@ -431,6 +379,12 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
             client.wait_for(lambda screen: " PREFIX " not in screen.splitlines()[-1], 8, "client-only Escape cancellation")
             settle(client)
             case["client_reset"] = {"prefix_observed": True, "escape_cancelled": True, "remote_unchanged": require_authoritative(remote, session, pane, expected, agent)}
+        if scenario == Scenario.UNCONFIRMED_INPUT:
+            # These canonical controls clear inline prediction without a new
+            # predictable text echo; the scratchpad must not depend on it.
+            os.write(client.master, b"\x01\x05")
+            settle(client)
+            case["unconfirmed_input"] = {"controls": "Ctrl-A Ctrl-E", "remote_unchanged": require_authoritative(remote, session, pane, expected, agent)}
         case["first_drop"] = gate.interrupt(client, session)
         case["first_drop"]["offline_edit"] = offline_burst(client, enabled, scenario)
         case["first_drop"]["remote_unchanged_during_gate"] = require_authoritative(remote, session, pane, expected, agent)
@@ -439,54 +393,38 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
             remote.cli("--session", session, "pane", "send-text", pane, CHANGED_DRAFT)
             expected = CHANGED_DRAFT
             case["context_change"] = require_authoritative(remote, session, pane, expected, agent)
-        elif enabled:
+        if enabled:
             expected += offline_suffix
         restoration_started = time.monotonic()
         gate.release()
-        if enabled and scenario != Scenario.CHANGED_CONTEXT:
+        if enabled:
             case["handoff_panel"] = wait_panel_retired(client, restoration_started)
-        case["restored"] = wait_restored(client, remote, session, pane, expected, agent, cursor_at_end=scenario != Scenario.CHANGED_CONTEXT, deadline=restoration_started + 45, recovery_suffix=offline_suffix)
+        case["restored"] = wait_restored(client, remote, session, pane, expected, agent, deadline=restoration_started + 45, recovery_suffix=offline_suffix)
         settle(client, 1)
         case["settled_once"] = require_authoritative(remote, session, pane, expected, agent)
-        if scenario == Scenario.CHANGED_CONTEXT:
-            case["retained_panel"] = panel_state(client, BURST_SUFFIX)
+        if panel_state(client, offline_suffix)["present"]:
+            raise RuntimeError("Transferred scratchpad panel remained pending")
+        if scenario in (Scenario.SECOND_DROP, Scenario.WIDE_UNICODE):
+            case["second_drop"] = gate.interrupt(client, session)
+            os.write(client.master, SECOND_SUFFIX.encode())
             if enabled:
-                if not exact_held_suffix(client, offline_suffix):
-                    raise RuntimeError("Changed editor did not preserve the exact generated recovery suffix")
-                if not all(case["retained_panel"][field] for field in ("present", "generated_suffix_visible")):
-                    raise RuntimeError("Changed editor did not retain the local reconnect draft")
-                if not all(case["retained_panel"][field] for field in ("copy_recovery_label_present", "copy_button_visible", "discard_button_visible")):
-                    raise RuntimeError("Changed editor did not advertise copy-recovery controls")
-            os.write(client.master, b"K")
-            expected += "K"
-            case["held_online_edit"] = wait_restored(client, remote, session, pane, expected, agent)
+                client.wait_for(lambda screen: PANEL_TITLE in screen and SECOND_SUFFIX in screen, 8, "second local reconnect suffix")
+                case["second_drop"]["scratchpad_controls"] = require_scratchpad_controls(client)
+            else:
+                settle(client)
+            case["second_drop"]["remote_unchanged_during_gate"] = require_authoritative(remote, session, pane, expected, agent)
             if enabled:
-                case["held_suffix_unchanged"] = exact_held_suffix(client, offline_suffix)
-                if not case["held_suffix_unchanged"]:
-                    raise RuntimeError("Online keyboard input altered the held recovery suffix")
-        else:
-            if panel_state(client, offline_suffix)["present"]:
-                raise RuntimeError("Successfully restored draft panel remained pending")
-            if scenario == Scenario.SECOND_DROP:
-                case["second_drop"] = gate.interrupt(client, session)
-                os.write(client.master, SECOND_SUFFIX.encode())
-                if enabled:
-                    client.wait_for(lambda screen: PANEL_TITLE in screen and SECOND_SUFFIX in screen, 8, "second local reconnect suffix")
-                else:
-                    settle(client)
-                case["second_drop"]["remote_unchanged_during_gate"] = require_authoritative(remote, session, pane, expected, agent)
-                if enabled:
-                    expected += SECOND_SUFFIX
-                restoration_started = time.monotonic()
-                gate.release()
-                if enabled:
-                    case["second_handoff_panel"] = wait_panel_retired(client, restoration_started)
-                case["second_restored"] = wait_restored(client, remote, session, pane, expected, agent, deadline=restoration_started + 45, recovery_suffix=SECOND_SUFFIX)
-                settle(client, 1)
-                case["second_settled_once"] = require_authoritative(remote, session, pane, expected, agent)
-            os.write(client.master, b"K")
-            expected += "K"
-            case["healthy_edit"] = wait_restored(client, remote, session, pane, expected, agent)
+                expected += SECOND_SUFFIX
+            restoration_started = time.monotonic()
+            gate.release()
+            if enabled:
+                case["second_handoff_panel"] = wait_panel_retired(client, restoration_started)
+            case["second_restored"] = wait_restored(client, remote, session, pane, expected, agent, deadline=restoration_started + 45, recovery_suffix=SECOND_SUFFIX)
+            settle(client, 1)
+            case["second_settled_once"] = require_authoritative(remote, session, pane, expected, agent)
+        os.write(client.master, b"K")
+        expected += "K"
+        case["healthy_edit"] = wait_restored(client, remote, session, pane, expected, agent)
         case["final_authoritative"] = require_authoritative(remote, session, pane, expected, agent)
         case["passed"] = True
     except EXPECTED_FAILURES as error:
@@ -542,15 +480,20 @@ def self_test():
     assert exact_draft_cursor(screen, expected)
     assert not draft_rows(f"› {expected}X", expected, agent="codex")
     assert not draft_rows(screen.text(), expected + "X", agent="codex", composed=True)
-    screen.feed((f"\x1b[40;28H{PANEL_TITLE} · copy to recover\x1b[40;131H[Discard]\x1b[41;28H{BURST_SUFFIX}").encode())
+    screen.feed((f"\x1b[40;28H{PANEL_TITLE} · {PANEL_QUEUED}\x1b[41;28H{BURST_SUFFIX}").encode())
 
     class ScreenProbe:
         def __init__(self, screen):
             self.screen = screen
 
-    assert exact_held_suffix(ScreenProbe(screen), BURST_SUFFIX)
-    screen.feed(b"K")
-    assert not exact_held_suffix(ScreenProbe(screen), BURST_SUFFIX)
+    assert require_scratchpad_controls(ScreenProbe(screen))["manual_recovery_controls_absent"]
+    screen.feed(b"\x1b[40;131H[Copy]")
+    try:
+        require_scratchpad_controls(ScreenProbe(screen))
+    except RuntimeError:
+        pass
+    else:
+        raise AssertionError("Manual recovery control was not rejected")
     read_ready = Event()
 
     class PumpProbe:
@@ -572,28 +515,13 @@ def self_test():
     with ThreadPoolExecutor(max_workers=1) as worker:
         source, _ = read_authoritative_while_pumping(worker, client, ReadProbe(), "generated", "own-pane", time.monotonic() + 5)
     assert source == BASE_DRAFT and client.calls >= 2
-    mismatch = 'event="reconnect.context_mismatch" phase="observe" ' + " ".join(f"{name}=false" for name in MISMATCH_BOOL_FIELDS) + " " + " ".join(f"{name}=0" for name in MISMATCH_COUNT_FIELDS)
-    parsed = parse_reconnect_diagnostics((
-        'unrelated secret="never-retain"',
-        mismatch + ' target="never-retain" pane_id="never-retain" draft="never-retain"',
-        'event="reconnect.echo_timeout" draft="never-retain"',
-        'event="reconnect.context_mismatch" phase="unexpected"',
-    ))
-    assert len(parsed["context_mismatches"]) == 1
-    assert set(parsed["context_mismatches"][0]) == {"phase", *MISMATCH_BOOL_FIELDS, *MISMATCH_COUNT_FIELDS}
-    assert parsed["echo_timeouts"] == 1
-    assert parsed["malformed_records"] == 1 and "never-retain" not in json.dumps(parsed)
-    bounded = parse_reconnect_diagnostics((mismatch.replace("symbol_changes=0", f"symbol_changes={index}") for index in range(MAX_DIAGNOSTIC_RECORDS + 1)))
-    assert len(bounded["context_mismatches"]) == MAX_DIAGNOSTIC_RECORDS and bounded["omitted_records"] == 1
-    assert bounded["context_mismatches"][0]["symbol_changes"] == 1
-    assert bounded["context_mismatches"][-1]["symbol_changes"] == MAX_DIAGNOSTIC_RECORDS
     with tempfile.TemporaryDirectory(prefix="herdr-rdraft-selftest-", dir="/tmp") as tmp:
         root = Path(tmp)
         log = root / "config/herdr-proto/sessions/generated/herdr-client.log"
         log.parent.mkdir(parents=True)
-        log.write_text(mismatch + '\nignored secret="never-retain"\n')
+        log.write_text('ignored draft="never-retain"\n')
         collected = collect_reconnect_diagnostics(root)
-        assert len(collected["context_mismatches"]) == 1 and not log.exists()
+        assert collected["removed_logs"] == 1 and not log.exists()
         assert "never-retain" not in json.dumps(collected)
         fake = root / "ssh-stub"
         fake.write_text("#!/bin/sh\nexit 0\n")
@@ -621,7 +549,7 @@ def self_test():
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=5)
-    print("owned bridge gate, continuous PTY draining, exact wide-Unicode cursor, held suffix, and bounded structural-only diagnostics assertions passed")
+    print("owned bridge gate, continuous PTY draining, exact wide-Unicode cursor, scratchpad controls, and diagnostic cleanup assertions passed")
 
 
 def main():

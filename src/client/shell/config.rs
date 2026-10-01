@@ -109,9 +109,6 @@ impl ClientShellState {
         if !self.config.remote_predict_input {
             self.input_prediction.clear();
         }
-        if !self.config.remote_buffer_reconnect_input {
-            self.reconnect_drafts.hold_all();
-        }
     }
 }
 
