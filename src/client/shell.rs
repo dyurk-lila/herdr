@@ -32,6 +32,7 @@ mod prediction_input;
 pub(crate) mod prediction_profiles;
 pub(crate) mod prediction_words;
 mod preferences;
+mod reconnect_delivery;
 mod reconnect_draft;
 pub(crate) mod reconnect_input;
 mod render;

@@ -70,7 +70,11 @@ impl ClientShellState {
 
     pub(super) fn reconnect_display_target(&self) -> Option<DraftTarget> {
         if let Some(target) = self.reconnect_target() {
-            if self.reconnect_drafts.view(&target).is_some() {
+            if self
+                .reconnect_drafts
+                .view(&target)
+                .is_some_and(|view| !view.handed_off)
+            {
                 return Some(target);
             }
         }
@@ -118,7 +122,7 @@ impl ClientShellState {
             return;
         };
         let anchor = self.reconnect_anchor(&target);
-        let allow_auto = anchor.as_ref().is_some_and(|(_, confirmed)| *confirmed);
+        let allow_auto = anchor.is_some() && self.reconnect_delivery.is_clean(&target);
         self.reconnect_drafts.disconnect(&target);
         if !self
             .reconnect_drafts
@@ -171,6 +175,7 @@ impl ClientShellState {
                 .reconnect_drafts
                 .view(&target)
                 .is_some_and(|view| view.reason == DraftReason::AwaitingEcho);
+            let intervening = self.reconnect_drafts.had_intervening_input(&target);
             let changed =
                 self.reconnect_drafts
                     .observe(&target, &anchor, generation, Instant::now());
@@ -180,7 +185,8 @@ impl ClientShellState {
                     .reconnect_drafts
                     .view(&target)
                     .is_none_or(|view| view.reason == DraftReason::Ready);
-            if confirmed {
+            if confirmed && !intervening {
+                self.reconnect_delivery.confirmed(&target);
                 self.input_prediction
                     .adopt_reconnect_echo(&target.pane_id, &anchor);
             }
@@ -204,12 +210,15 @@ impl ClientShellState {
             self.reconnect_drafts
                 .attempt(&target, &anchor, generation, Instant::now())?;
         let mut events = vec![ClientPaneInputEvent::TextCommit(attempt.text)];
-        if attempt.trailing_left > 0 {
+        let mut trailing_left = attempt.trailing_left;
+        while trailing_left > 0 {
+            let repeat_count = trailing_left.min(usize::from(u16::MAX)) as u16;
+            trailing_left -= usize::from(repeat_count);
             events.push(ClientPaneInputEvent::Key {
                 code: crate::protocol::ClientKeyCode::Left,
                 modifiers: 0,
                 kind: crate::protocol::ClientKeyKind::Press,
-                repeat_count: attempt.trailing_left as u16,
+                repeat_count,
                 generated_text: None,
                 shifted_codepoint: None,
                 tracks_release: false,
@@ -217,9 +226,37 @@ impl ClientShellState {
                 windows_record: None,
             });
         }
+        self.reconnect_delivery.sent(&target);
+        if self.prediction_allowed() {
+            self.input_prediction
+                .select_machine(&self.active_endpoint_id);
+            self.input_prediction
+                .set_agent_context(self.reconnect_agent(&target.pane_id));
+            if let Some(surface) = self.pane_surface.as_ref() {
+                for event in &events {
+                    self.input_prediction.record_input(
+                        surface,
+                        &target.pane_id,
+                        event,
+                        Instant::now(),
+                    );
+                }
+            }
+        }
         Some(ClientMessage::ClientShellPaneInput {
             pane_id: target.pane_id,
             events,
+        })
+    }
+
+    /// Hide the local editor only after canonical transport accepts its one-shot payload.
+    pub(crate) fn commit_reconnect_draft_handoff(&mut self, request: &ClientMessage) -> bool {
+        let ClientMessage::ClientShellPaneInput { pane_id, .. } = request else {
+            return false;
+        };
+        self.reconnect_drafts.mark_handed_off(&DraftTarget {
+            endpoint_id: self.active_endpoint_id.clone(),
+            pane_id: pane_id.clone(),
         })
     }
 
@@ -251,6 +288,14 @@ impl ClientShellState {
             if contains(self.hits.reconnect_panel, (mouse.column, mouse.row)) {
                 return true;
             }
+        }
+        if self.reconnect_input_ready
+            && self
+                .reconnect_drafts
+                .view(&target)
+                .is_some_and(|view| view.reason != DraftReason::Ready)
+        {
+            return false;
         }
         if !self.config.remote_buffer_reconnect_input
             || self.mode != ClientShellMode::Terminal
@@ -377,7 +422,10 @@ impl ClientShellState {
                 DraftReason::Ready => "Queued locally",
                 DraftReason::AwaitingEcho => "Waiting for remote echo",
                 DraftReason::UncertainDelivery => "Delivery uncertain; copy to recover",
-                _ => "Editor changed; copy to recover",
+                DraftReason::NoAnchor => "Editor not recognized; copy to recover",
+                DraftReason::ManualRecovery => "Unconfirmed input; copy to recover",
+                DraftReason::UnsupportedText => "Unsupported editor; copy to recover",
+                DraftReason::ContextChanged => "Editor changed; copy to recover",
             },
         };
         let label = if self.reconnect_target().as_ref() == Some(&target) {

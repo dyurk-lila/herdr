@@ -106,9 +106,13 @@ permission guarantee. An unexpected predicted echo invalidates that machine/agen
 profile; input itself is always forwarded once, regardless of prediction.
 
 With `buffer_reconnect_input`, detected outages open an editable local reconnect
-draft. Editing continues through the entire reconnect handshake. A confirmed,
-unchanged Claude/Codex row permits one best-effort insertion after activation;
-changed context or uncertain delivery offers Copy/Discard and never retries.
+draft. Editing continues through the entire reconnect handshake. A recognized,
+unchanged Claude/Codex row with clean delivery permits one best-effort insertion
+after activation, independently of client-only prediction resets. Successful
+canonical enqueue hides the panel and restores agent input immediately. New
+wide/wrapped Unicode suffixes can transfer without inline projection. Changed
+context or uncertain delivery offers Copy/Discard and never retries; online
+recovery panels do not capture ordinary keyboard input.
 Drafts are bounded, client-local and volatile. Editing applies to the never-sent
 suffix; Enter and unsupported controls are not queued. See
 [offline typing](../OFFLINE_TYPING.md) for recovery gates and delivery limits.

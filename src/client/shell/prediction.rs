@@ -767,6 +767,28 @@ impl InputPrediction {
         })
     }
 
+    pub(super) fn has_unconfirmed_input(&self) -> bool {
+        self.line
+            .as_ref()
+            .is_some_and(|line| !line.pending.is_empty() || line.word_learning.is_some())
+    }
+
+    pub(super) fn confirmed_row(&self, surface: &PaneSurfaceFrame, pane_id: &str) -> bool {
+        let Some(row) = eligible_row(surface, pane_id) else {
+            return false;
+        };
+        self.line.as_ref().is_some_and(|line| {
+            line.pane_id == pane_id
+                && line.matches_context(surface, &row)
+                && line.trained
+                && !line.expired
+                && line.pending.is_empty()
+                && line.word_learning.is_none()
+                && line.x == row.x
+                && line.row == row.cells
+        })
+    }
+
     pub(super) fn deadline(&self) -> Option<Instant> {
         self.line.as_ref().and_then(PredictedLine::deadline)
     }

@@ -447,7 +447,7 @@ pub(super) fn complete_endpoint_activation(
             shell.set_reconnect_input_ready(ready);
             if ready {
                 if let Some(request) = shell.take_reconnect_draft_input() {
-                    write_to_server(endpoints, &request).map_err(ClientError::ConnectionLost)?;
+                    send_reconnect_draft(endpoints, shell, &request);
                 }
             }
         }
@@ -688,6 +688,15 @@ pub(super) fn install_client_shell_snapshot(
     Ok(())
 }
 
+pub(super) fn send_reconnect_draft(
+    endpoints: &mut endpoint::EndpointRegistry,
+    shell: &mut shell::ClientShellState,
+    request: &ClientMessage,
+) -> bool {
+    endpoints.send(request) == endpoint::EndpointSendOutcome::Sent
+        && shell.commit_reconnect_draft_handoff(request)
+}
+
 pub(super) fn finish_client_shell_input(
     state: &mut ClientState,
     outcome: shell::ClientShellInput,
@@ -738,7 +747,7 @@ pub(super) fn finish_client_shell_input(
         &mut state.detached_process_children,
         scheduled_activation,
     )?;
-    let frame = if dispatch_repaint {
+    let mut frame = if dispatch_repaint {
         state
             .shell
             .as_mut()
@@ -761,7 +770,9 @@ pub(super) fn finish_client_shell_input(
         if ready {
             if let Some(request) = shell.take_reconnect_draft_input() {
                 // Marked attempted before transport enqueue; never retried automatically.
-                write_to_server(endpoints, &request).map_err(ClientError::ConnectionLost)?;
+                if send_reconnect_draft(endpoints, shell, &request) {
+                    frame = shell.compose(state.reported_size.0, state.reported_size.1);
+                }
             }
         }
     }

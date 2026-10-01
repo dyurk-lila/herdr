@@ -121,6 +121,28 @@ impl ClientShellState {
         event: &ClientPaneInputEvent,
         outcome: &mut ClientShellInput,
     ) {
+        if let ClientInputTarget::Pane(pane_id) = target {
+            if (self.primary_remote || !self.active_endpoint_id.is_local())
+                && !matches!(
+                    event,
+                    ClientPaneInputEvent::Key {
+                        kind: crate::protocol::ClientKeyKind::Release,
+                        ..
+                    } | ClientPaneInputEvent::Mouse {
+                        kind: crate::protocol::ClientMouseKind::Up(_)
+                            | crate::protocol::ClientMouseKind::Moved,
+                        ..
+                    }
+                )
+            {
+                let target = super::reconnect_draft::DraftTarget {
+                    endpoint_id: self.active_endpoint_id.clone(),
+                    pane_id: pane_id.clone(),
+                };
+                self.reconnect_delivery.sent(&target);
+                self.reconnect_drafts.mark_intervening_input(&target);
+            }
+        }
         if !self.prediction_allowed() {
             outcome.repaint |= self.input_prediction.clear();
             return;
@@ -148,7 +170,19 @@ impl ClientShellState {
             self.input_prediction
                 .select_machine(&self.active_endpoint_id);
             self.input_prediction.set_agent_context(agent);
+            let unconfirmed = self.input_prediction.has_unconfirmed_input();
             self.input_prediction.observe(surface, Instant::now());
+            if unconfirmed {
+                if let Some(pane_id) = self.focused_pane_id() {
+                    if self.input_prediction.confirmed_row(surface, &pane_id) {
+                        self.reconnect_delivery
+                            .confirmed(&super::reconnect_draft::DraftTarget {
+                                endpoint_id: self.active_endpoint_id.clone(),
+                                pane_id,
+                            });
+                    }
+                }
+            }
         }
     }
 

@@ -12,7 +12,7 @@ use crate::detect::Agent;
 use crate::protocol::{CellData, SurfaceRect};
 use crate::raw_input::RawInputEvent;
 
-const MAX_TARGETS: usize = 16;
+pub(super) const MAX_TARGETS: usize = 16;
 const MAX_TEXT_BYTES: usize = 64 * 1024;
 const MAX_REPEAT: usize = 256;
 const ATTEMPT_TIMEOUT: Duration = Duration::from_secs(3);
@@ -155,11 +155,12 @@ pub(super) struct DraftView<'a> {
     pub uncertain: Option<&'a str>,
     pub reason: DraftReason,
     pub notice: Option<DraftNotice>,
+    pub handed_off: bool,
 }
 
 struct PendingAttempt {
     payload: DraftAttempt,
-    expected: DraftAnchor,
+    expected: Option<DraftAnchor>,
     generation: u64,
     started: Instant,
 }
@@ -173,6 +174,8 @@ struct Draft {
     uncertain: Option<DraftAttempt>,
     reason: DraftReason,
     notice: Option<DraftNotice>,
+    handed_off: bool,
+    intervening_input: bool,
 }
 
 impl Draft {
@@ -221,7 +224,13 @@ impl ReconnectDrafts {
         anchor: Option<DraftAnchor>,
         allow_auto: bool,
     ) -> bool {
-        if self.entries.iter().any(|draft| draft.target == *target) {
+        if let Some(draft) = self
+            .entries
+            .iter_mut()
+            .find(|draft| draft.target == *target)
+        {
+            draft.handed_off = false;
+            draft.make_uncertain();
             return true;
         }
         if self.entries.len() == MAX_TARGETS {
@@ -244,6 +253,8 @@ impl ReconnectDrafts {
             uncertain: None,
             reason,
             notice: None,
+            handed_off: false,
+            intervening_input: false,
         });
         true
     }
@@ -267,6 +278,7 @@ impl ReconnectDrafts {
                 .map(|attempt| attempt.text.as_str()),
             reason: draft.reason,
             notice: draft.notice,
+            handed_off: draft.handed_off,
         })
     }
 
@@ -389,6 +401,7 @@ impl ReconnectDrafts {
             .find(|draft| draft.target == *target)?;
         draft.expire(now);
         if !draft.allow_auto
+            || draft.handed_off
             || draft.pending.is_some()
             || draft.uncertain.is_some()
             || draft.editor.is_empty()
@@ -405,9 +418,18 @@ impl ReconnectDrafts {
             draft.reason = DraftReason::ContextChanged;
             return None;
         }
-        let Some((expected, trailing_left)) = expected_anchor(anchor, &draft.editor) else {
+        if !auto_anchor(anchor) || draft.editor.chars().any(char::is_control) {
             draft.reason = DraftReason::UnsupportedText;
             return None;
+        }
+        let (expected, trailing_left) = match expected_anchor(anchor, &draft.editor) {
+            Some((expected, trailing_left)) => (Some(expected), trailing_left),
+            None => (
+                None,
+                draft.editor.as_str()[draft.editor.cursor_position()..]
+                    .graphemes(true)
+                    .count(),
+            ),
         };
         let payload = DraftAttempt {
             text: draft.editor.as_str().to_owned(),
@@ -422,7 +444,44 @@ impl ReconnectDrafts {
         });
         draft.reason = DraftReason::AwaitingEcho;
         draft.notice = None;
+        draft.intervening_input = false;
         Some(payload)
+    }
+
+    /// The caller sets this only after successfully queueing the canonical input.
+    pub fn mark_handed_off(&mut self, target: &DraftTarget) -> bool {
+        let Some(draft) = self
+            .entries
+            .iter_mut()
+            .find(|draft| draft.target == *target)
+        else {
+            return false;
+        };
+        if draft.pending.is_none() || draft.handed_off {
+            return false;
+        }
+        draft.handed_off = true;
+        true
+    }
+
+    pub fn had_intervening_input(&self, target: &DraftTarget) -> bool {
+        self.entries
+            .iter()
+            .find(|draft| draft.target == *target)
+            .is_some_and(|draft| draft.intervening_input)
+    }
+
+    pub fn mark_intervening_input(&mut self, target: &DraftTarget) -> bool {
+        let Some(draft) = self
+            .entries
+            .iter_mut()
+            .find(|draft| draft.target == *target)
+        else {
+            return false;
+        };
+        let changed = !draft.intervening_input;
+        draft.intervening_input = true;
+        changed
     }
 
     /// Exact echo only retires an attempt on its original connection generation.
@@ -448,7 +507,11 @@ impl ReconnectDrafts {
             if generation != pending.generation {
                 return draft.make_uncertain();
             }
-            if echo_matches(current, &pending.expected) {
+            if pending
+                .expected
+                .as_ref()
+                .is_some_and(|expected| echo_matches(current, expected))
+            {
                 draft.anchor = Some(current.clone());
                 draft.pending = None;
                 draft.reason = DraftReason::Ready;
@@ -458,7 +521,9 @@ impl ReconnectDrafts {
                 return true;
             }
             // Intermediate echoes are possible. No mismatch can authorize a retry.
-            pending.expected.trace_mismatch(current, "echo");
+            if let Some(expected) = &pending.expected {
+                expected.trace_mismatch(current, "echo");
+            }
             return false;
         }
         if draft.allow_auto && draft.anchor.as_ref() != Some(current) {
@@ -473,10 +538,16 @@ impl ReconnectDrafts {
     }
 
     pub fn disconnect(&mut self, target: &DraftTarget) -> bool {
-        self.entries
+        let Some(draft) = self
+            .entries
             .iter_mut()
             .find(|draft| draft.target == *target)
-            .is_some_and(Draft::make_uncertain)
+        else {
+            return false;
+        };
+        let changed = draft.handed_off;
+        draft.handed_off = false;
+        draft.make_uncertain() || changed
     }
 
     pub fn hold(&mut self, target: &DraftTarget) -> bool {
@@ -521,7 +592,7 @@ impl ReconnectDrafts {
         } else {
             attempt
                 .text
-                .char_indices()
+                .grapheme_indices(true)
                 .rev()
                 .nth(attempt.trailing_left - 1)
                 .map(|(index, _)| index)
@@ -610,19 +681,22 @@ fn echo_matches(current: &DraftAnchor, expected: &DraftAnchor) -> bool {
             })
 }
 
-fn expected_anchor(anchor: &DraftAnchor, editor: &TextEditor) -> Option<(DraftAnchor, usize)> {
-    if !anchor.valid()
-        || anchor.row.iter().any(|cell| cell.skip)
-        || anchor.row[anchor.input_start..=anchor.input_end]
+fn auto_anchor(anchor: &DraftAnchor) -> bool {
+    anchor.valid()
+        && !anchor.row.iter().any(|cell| cell.skip)
+        && !anchor.row[anchor.input_start..=anchor.input_end]
             .iter()
             .any(|cell| cell.hyperlink.is_some())
-        || !anchor.row[anchor.input_end..]
+        && anchor.row[anchor.input_end..]
             .iter()
             .all(|cell| cell.symbol == " ")
-        || !anchor.row[anchor.input_start..anchor.input_end]
+        && anchor.row[anchor.input_start..anchor.input_end]
             .iter()
             .all(|cell| !cell.skip && cell.hyperlink.is_none() && safe_scalar(&cell.symbol))
-    {
+}
+
+fn expected_anchor(anchor: &DraftAnchor, editor: &TextEditor) -> Option<(DraftAnchor, usize)> {
+    if !auto_anchor(anchor) {
         return None;
     }
     let symbols: Vec<_> = editor.graphemes(true).collect();
@@ -770,7 +844,14 @@ mod tests {
             drafts.begin(&target, Some(initial.clone()), true);
             text(&mut drafts, &target, "x");
             drafts.attempt(&target, &initial, 1, now).unwrap();
-            let expected = drafts.entries[0].pending.as_ref().unwrap().expected.clone();
+            let expected = drafts.entries[0]
+                .pending
+                .as_ref()
+                .unwrap()
+                .expected
+                .as_ref()
+                .unwrap()
+                .clone();
             if timeout {
                 assert!(drafts.tick(now + ATTEMPT_TIMEOUT));
                 assert!(!drafts.observe(&target, &expected, 1, now + ATTEMPT_TIMEOUT));
@@ -791,7 +872,14 @@ mod tests {
         drafts.begin(&target, Some(initial.clone()), true);
         text(&mut drafts, &target, "abc");
         drafts.attempt(&target, &initial, 1, now).unwrap();
-        let expected = drafts.entries[0].pending.as_ref().unwrap().expected.clone();
+        let expected = drafts.entries[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .expected
+            .as_ref()
+            .unwrap()
+            .clone();
         text(&mut drafts, &target, "def");
         assert!(drafts.observe(&target, &expected, 1, now));
         assert_eq!(drafts.copy_text(&target).unwrap(), "def");
@@ -838,19 +926,13 @@ mod tests {
     }
 
     #[test]
-    fn unicode_local_editor_is_grapheme_safe_but_complex_text_stays_local() {
+    fn unicode_local_editor_is_grapheme_safe_without_complex_inline_prediction() {
         let target = target("pane");
         let initial = anchor();
         let mut drafts = ReconnectDrafts::default();
         drafts.begin(&target, Some(initial.clone()), true);
         text(&mut drafts, &target, "e\u{301}中👩‍💻");
-        assert!(drafts
-            .attempt(&target, &initial, 1, Instant::now())
-            .is_none());
-        assert_eq!(
-            drafts.view(&target).unwrap().reason,
-            DraftReason::UnsupportedText
-        );
+        assert!(expected_anchor(&initial, drafts.view(&target).unwrap().editor).is_none());
         for remaining in ["e\u{301}中", "e\u{301}", ""] {
             key(&mut drafts, &target, KeyCode::Backspace);
             assert_eq!(drafts.copy_text(&target).unwrap(), remaining);
@@ -874,7 +956,13 @@ mod tests {
             .attempt(&target, &initial, 1, Instant::now())
             .unwrap();
         assert_eq!(attempt.trailing_left, 1);
-        let expected = &drafts.entries[0].pending.as_ref().unwrap().expected;
+        let expected = drafts.entries[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .expected
+            .as_ref()
+            .unwrap();
         assert_eq!(expected.x, initial.x + 2);
         assert_eq!(expected.input_end, initial.input_end + 3);
     }
@@ -1017,8 +1105,8 @@ mod tests {
     }
 
     #[test]
-    fn opaque_tail_unsafe_existing_text_and_wrapping_remain_copy_only() {
-        for case in 0..3 {
+    fn opaque_tail_and_unsafe_existing_text_remain_copy_only() {
+        for case in 0..2 {
             let target = target("pane");
             let mut initial = anchor();
             match case {
@@ -1026,10 +1114,6 @@ mod tests {
                 1 => {
                     initial.input_end += 1;
                     initial.row[2].symbol = "中".to_owned();
-                }
-                2 => {
-                    initial.input_end = 38;
-                    initial.x = initial.geometry.x + 38;
                 }
                 _ => unreachable!(),
             }
@@ -1055,12 +1139,26 @@ mod tests {
         key(&mut drafts, &target, KeyCode::Left);
         let first = drafts.attempt(&target, &initial, 1, now).unwrap();
         assert_eq!(first.trailing_left, 2);
-        let first_echo = drafts.entries[0].pending.as_ref().unwrap().expected.clone();
+        let first_echo = drafts.entries[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .expected
+            .as_ref()
+            .unwrap()
+            .clone();
         text(&mut drafts, &target, "xy");
         assert!(drafts.observe(&target, &first_echo, 1, now));
         let second = drafts.attempt(&target, &first_echo, 1, now).unwrap();
         assert_eq!(second.text, "xy");
-        let second_echo = drafts.entries[0].pending.as_ref().unwrap().expected.clone();
+        let second_echo = drafts.entries[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .expected
+            .as_ref()
+            .unwrap()
+            .clone();
         assert_eq!(
             second_echo.row[2..8]
                 .iter()
@@ -1087,7 +1185,13 @@ mod tests {
         assert!(drafts
             .attempt(&target, &initial, 1, Instant::now())
             .is_some());
-        let expected = &drafts.entries[0].pending.as_ref().unwrap().expected;
+        let expected = drafts.entries[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .expected
+            .as_ref()
+            .unwrap();
         assert_eq!(
             expected.row[2..5]
                 .iter()
@@ -1220,7 +1324,14 @@ mod tests {
         drafts.begin(&target, Some(initial.clone()), true);
         text(&mut drafts, &target, "abc");
         drafts.attempt(&target, &initial, 1, now).unwrap();
-        let mut echo = drafts.entries[0].pending.as_ref().unwrap().expected.clone();
+        let mut echo = drafts.entries[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .expected
+            .as_ref()
+            .unwrap()
+            .clone();
         for cell in &mut echo.row[echo.input_start..=echo.input_end] {
             cell.fg = 1;
             cell.bg = 2;
@@ -1231,7 +1342,13 @@ mod tests {
         assert_eq!(drafts.entries[0].anchor.as_ref(), Some(&echo));
         let next = drafts.attempt(&target, &echo, 1, now).unwrap();
         assert_eq!(next.text, "λ");
-        let expected = &drafts.entries[0].pending.as_ref().unwrap().expected;
+        let expected = drafts.entries[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .expected
+            .as_ref()
+            .unwrap();
         assert_eq!(expected.row[2..5], echo.row[2..5]);
         assert_eq!(expected.row[5].symbol, "λ");
         assert_eq!(expected.row[5].fg, echo.row[5].fg);
@@ -1253,7 +1370,14 @@ mod tests {
                 drafts.begin(&target, Some(initial.clone()), true);
                 text(&mut drafts, &target, "abc");
                 drafts.attempt(&target, &initial, 1, now).unwrap();
-                let mut echo = drafts.entries[0].pending.as_ref().unwrap().expected.clone();
+                let mut echo = drafts.entries[0]
+                    .pending
+                    .as_ref()
+                    .unwrap()
+                    .expected
+                    .as_ref()
+                    .unwrap()
+                    .clone();
                 change_metadata(&mut echo.row[index], field);
                 assert!(
                     !drafts.observe(&target, &echo, 1, now),
@@ -1265,5 +1389,155 @@ mod tests {
                 assert_eq!(drafts.view(&target).unwrap().uncertain, Some("abc"));
             }
         }
+    }
+
+    #[test]
+    fn successful_queue_hides_draft_but_is_not_itself_echo_confirmation() {
+        let now = Instant::now();
+        let target = target("pane");
+        let initial = anchor();
+        let mut drafts = ReconnectDrafts::default();
+        drafts.begin(&target, Some(initial.clone()), true);
+        text(&mut drafts, &target, "abc");
+        assert!(!drafts.mark_handed_off(&target));
+        drafts.attempt(&target, &initial, 1, now).unwrap();
+        assert!(!drafts.view(&target).unwrap().handed_off);
+        assert!(drafts.mark_handed_off(&target));
+        assert!(!drafts.mark_handed_off(&target));
+        assert!(drafts.view(&target).unwrap().handed_off);
+        assert_eq!(drafts.view(&target).unwrap().attempted, Some("abc"));
+        assert!(!drafts.observe(&target, &initial, 1, now));
+        let echo = drafts.entries[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .expected
+            .as_ref()
+            .unwrap()
+            .clone();
+        assert!(drafts.observe(&target, &echo, 1, now));
+        assert!(drafts.view(&target).is_none());
+    }
+
+    #[test]
+    fn timeout_keeps_handoff_hidden_and_a_drop_restores_uncertain_recovery() {
+        let now = Instant::now();
+        let target = target("pane");
+        let initial = anchor();
+        let mut drafts = ReconnectDrafts::default();
+        drafts.begin(&target, Some(initial.clone()), true);
+        text(&mut drafts, &target, "abc");
+        drafts.attempt(&target, &initial, 1, now).unwrap();
+        drafts.mark_handed_off(&target);
+        assert!(drafts.tick(now + ATTEMPT_TIMEOUT));
+        assert!(drafts.view(&target).unwrap().handed_off);
+        assert_eq!(drafts.view(&target).unwrap().uncertain, Some("abc"));
+        assert!(drafts.disconnect(&target));
+        assert!(!drafts.view(&target).unwrap().handed_off);
+        text(&mut drafts, &target, "x");
+        assert_eq!(drafts.copy_text(&target).unwrap(), "abcx");
+        assert!(drafts.attempt(&target, &initial, 2, now).is_none());
+    }
+
+    #[test]
+    fn wide_combining_and_wrapped_text_handoff_once_without_inline_prediction() {
+        for text_value in ["e\u{301}中👩‍💻".to_owned(), "x".repeat(100)] {
+            let now = Instant::now();
+            let target = target("pane");
+            let initial = anchor();
+            let mut drafts = ReconnectDrafts::default();
+            drafts.begin(&target, Some(initial.clone()), true);
+            text(&mut drafts, &target, &text_value);
+            key(&mut drafts, &target, KeyCode::Left);
+            key(&mut drafts, &target, KeyCode::Left);
+            let payload = drafts.attempt(&target, &initial, 1, now).unwrap();
+            assert_eq!(payload.text, text_value);
+            assert_eq!(payload.trailing_left, 2);
+            assert!(drafts.entries[0]
+                .pending
+                .as_ref()
+                .unwrap()
+                .expected
+                .is_none());
+            assert!(drafts.attempt(&target, &initial, 1, now).is_none());
+            assert!(drafts.mark_handed_off(&target));
+            assert!(!drafts.observe(&target, &initial, 1, now));
+            assert!(drafts.view(&target).unwrap().handed_off);
+            assert!(drafts.disconnect(&target));
+            assert!(!drafts.view(&target).unwrap().handed_off);
+            text(&mut drafts, &target, "λ");
+            let cursor = text_value.grapheme_indices(true).rev().nth(1).unwrap().0;
+            let mut copied = text_value.clone();
+            copied.insert(cursor, 'λ');
+            assert_eq!(drafts.copy_text(&target).unwrap(), copied);
+            assert!(drafts.attempt(&target, &initial, 2, now).is_none());
+        }
+    }
+
+    #[test]
+    fn later_canonical_input_is_recorded_before_old_exact_echo_retires_receipt() {
+        let now = Instant::now();
+        let target = target("pane");
+        let initial = anchor();
+        let mut drafts = ReconnectDrafts::default();
+        drafts.begin(&target, Some(initial.clone()), true);
+        text(&mut drafts, &target, "abc");
+        drafts.attempt(&target, &initial, 1, now).unwrap();
+        drafts.mark_handed_off(&target);
+        assert!(!drafts.had_intervening_input(&target));
+        assert!(drafts.mark_intervening_input(&target));
+        assert!(!drafts.mark_intervening_input(&target));
+        let echo = drafts.entries[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .expected
+            .as_ref()
+            .unwrap()
+            .clone();
+        let delivery_barrier_must_remain = drafts.had_intervening_input(&target);
+        assert!(drafts.observe(&target, &echo, 1, now));
+        assert!(delivery_barrier_must_remain);
+        assert!(drafts.view(&target).is_none());
+    }
+
+    #[test]
+    fn full_text_budget_is_preserved_after_unprojectable_handoff() {
+        let now = Instant::now();
+        let target = target("pane");
+        let initial = anchor();
+        let mut drafts = ReconnectDrafts::default();
+        drafts.begin(&target, Some(initial.clone()), true);
+        let full = "x".repeat(MAX_TEXT_BYTES);
+        assert!(!text(&mut drafts, &target, &full).bounded);
+        let payload = drafts.attempt(&target, &initial, 1, now).unwrap();
+        assert_eq!(payload.text.len(), MAX_TEXT_BYTES);
+        assert!(drafts.entries[0]
+            .pending
+            .as_ref()
+            .unwrap()
+            .expected
+            .is_none());
+        drafts.mark_handed_off(&target);
+        drafts.disconnect(&target);
+        assert!(text(&mut drafts, &target, "λ").bounded);
+        assert_eq!(drafts.copy_text(&target).unwrap(), full);
+        assert!(drafts.attempt(&target, &initial, 2, now).is_none());
+    }
+
+    #[test]
+    fn beginning_existing_draft_restores_recovery_without_retrying_pending_input() {
+        let now = Instant::now();
+        let target = target("pane");
+        let initial = anchor();
+        let mut drafts = ReconnectDrafts::default();
+        drafts.begin(&target, Some(initial.clone()), true);
+        text(&mut drafts, &target, "abc");
+        drafts.attempt(&target, &initial, 1, now).unwrap();
+        drafts.mark_handed_off(&target);
+        assert!(drafts.begin(&target, Some(initial.clone()), true));
+        assert!(!drafts.view(&target).unwrap().handed_off);
+        assert_eq!(drafts.view(&target).unwrap().uncertain, Some("abc"));
+        assert!(drafts.attempt(&target, &initial, 2, now).is_none());
     }
 }

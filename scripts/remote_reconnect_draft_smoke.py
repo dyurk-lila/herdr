@@ -24,20 +24,21 @@ import sys
 import tempfile
 from threading import Event
 import time
+import unicodedata
 import uuid
 
 from remote_agent_latency_smoke import (
     AgentClient,
+    CursorScreen,
     EDIT_KEYS,
     EditOperation,
     binary_digest,
-    draft_rows,
-    exact_draft_cursor,
+    draft_rows as agent_draft_rows,
     own_pane_agent_metadata,
     sample_key,
     wait_for_agent,
 )
-from remote_latency_smoke import Remote, bridge_children
+from remote_latency_smoke import Remote, WIDTH, bridge_children
 
 PANEL_TITLE = "Reconnect draft"
 PANEL_QUEUED = "Queued locally"
@@ -45,6 +46,9 @@ BASE_DRAFT = "ZQreconnect"
 CHANGED_DRAFT = "ZQchanged"
 BURST_SUFFIX = "méoz"
 SECOND_SUFFIX = "λnext"
+WIDE_SUFFIX = "界🧪λ"
+PREFIX_KEY = b"\x02"
+ESCAPE_KEY = b"\x1b"
 BURST = (
     b"mnop" + EDIT_KEYS[EditOperation.LEFT] * 2
     + EDIT_KEYS[EditOperation.BACKSPACE] + "é".encode()
@@ -69,6 +73,8 @@ class Scenario(StrEnum):
     RESTORE = "restore"
     SECOND_DROP = "second-drop"
     CHANGED_CONTEXT = "changed-context"
+    CLIENT_RESET = "client-reset"
+    WIDE_UNICODE = "wide-unicode"
 
 
 class BridgePhase(StrEnum):
@@ -253,6 +259,36 @@ def require_authoritative(remote, session, pane, expected, agent):
     return {"generated_draft": expected, "exact_row_count": len(rows)}
 
 
+def display_width(text):
+    return sum(0 if unicodedata.combining(char) else 2 if unicodedata.east_asian_width(char) in "WF" else 1 for char in text)
+
+
+def draft_rows(source, expected, *, agent, composed=False):
+    if composed:
+        source = "\n".join(
+            line[:-1] if line.endswith(" ▐") and display_width(line) == WIDTH else line
+            for line in source.splitlines()
+        )
+    return agent_draft_rows(source, expected, composed=composed, agent=agent)
+
+
+def exact_draft_cursor(screen, expected):
+    rows = draft_rows(screen.text(), expected, composed=True, agent=screen.agent)
+    if len(rows) != 1:
+        return False
+    row, line = rows[0]
+    start = display_width(line[:line.index(expected)])
+    return screen.row == row and screen.col == start + display_width(expected)
+
+
+def generated_evidence(client, expected):
+    rows = draft_rows(client.screen.text(), expected, composed=True, agent=client.screen.agent)
+    return {
+        "outer_cursor": client.screen.evidence()["outer_cursor"],
+        "generated_rows": [{"row": row, "start_col": display_width(line[:line.index(expected)]), "draft": expected} for row, line in rows],
+    }
+
+
 def read_authoritative_while_pumping(worker, client, remote, session, pane, deadline):
     started = time.monotonic()
     # Remote retries only a failed pre-authentication banner, at most once.
@@ -264,8 +300,9 @@ def read_authoritative_while_pumping(worker, client, remote, session, pane, dead
     return source, (time.monotonic() - started) * 1000
 
 
-def wait_restored(client, remote, session, pane, expected, agent, *, cursor_at_end=True):
-    deadline = time.monotonic() + 45
+def wait_restored(client, remote, session, pane, expected, agent, *, cursor_at_end=True, deadline=None, recovery_suffix=BURST_SUFFIX):
+    if deadline is None:
+        deadline = time.monotonic() + 45
     max_control_read_ms = 0
     with ThreadPoolExecutor(max_workers=1) as worker:
         while True:
@@ -275,10 +312,10 @@ def wait_restored(client, remote, session, pane, expected, agent, *, cursor_at_e
             rows = draft_rows(source, expected, agent=agent)
             client.pump(0)
             local_rows = draft_rows(client.screen.text(), expected, composed=True, agent=agent)
-            cursor_matches = not cursor_at_end or exact_draft_cursor(client.screen, expected, len(expected))
+            cursor_matches = not cursor_at_end or exact_draft_cursor(client.screen, expected)
             timed_out = time.monotonic() >= deadline
             if not timed_out and len(rows) == 1 and len(local_rows) == 1 and cursor_matches:
-                return {"generated_draft": expected, "exact_row_count": 1, "local": client.screen.evidence(expected), "max_control_read_ms": round(max_control_read_ms, 2)}
+                return {"generated_draft": expected, "exact_row_count": 1, "local": generated_evidence(client, expected), "max_control_read_ms": round(max_control_read_ms, 2)}
             if timed_out:
                 candidates = (BASE_DRAFT, BASE_DRAFT + BURST_SUFFIX, BASE_DRAFT + BURST_SUFFIX + SECOND_SUFFIX, CHANGED_DRAFT, expected)
                 raise RestoreFailure({
@@ -291,7 +328,7 @@ def wait_restored(client, remote, session, pane, expected, agent, *, cursor_at_e
                         for draft in dict.fromkeys(candidates)
                     },
                     "local_cursor": client.screen.evidence()["outer_cursor"],
-                    "panel": panel_state(client, BURST_SUFFIX),
+                    "panel": panel_state(client, recovery_suffix),
                     "max_control_read_ms": round(max_control_read_ms, 2),
                 })
 
@@ -301,16 +338,39 @@ def panel_state(client, suffix):
     return {"present": PANEL_TITLE in screen, "queued_label_present": PANEL_QUEUED in screen, "generated_suffix_visible": suffix in screen, "copy_recovery_label_present": "copy to recover" in screen.lower(), "copy_button_visible": "[Copy]" in screen, "discard_button_visible": "[Discard]" in screen}
 
 
-def offline_burst(client, enabled):
+def exact_held_suffix(client, suffix):
+    lines = client.screen.text().splitlines()
+    headers = [(row, line) for row, line in enumerate(lines[:-1]) if PANEL_TITLE in line and "[Discard]" in line]
+    if len(headers) != 1:
+        return False
+    row, header = headers[0]
+    start = display_width(header[:header.index(PANEL_TITLE)])
+    end = display_width(header[:header.index("[Discard]") + len("[Discard]")])
+    text = "".join(client.screen.cells[row + 1][start:end]).strip(" \u00a0")
+    return text == suffix
+
+
+def wait_panel_retired(client, started):
+    remaining = started + 45 - time.monotonic()
+    if remaining <= 0:
+        raise RuntimeError("Reconnect handoff exceeded the shared restoration deadline")
+    client.wait_for(lambda screen: PANEL_TITLE not in screen, remaining, "automatic reconnect handoff without a copy click")
+    return {"panel_absent": True, "copy_clicked": False, "retirement_ms": round((time.monotonic() - started) * 1000, 2)}
+
+
+def offline_burst(client, enabled, scenario):
+    wide = scenario == Scenario.WIDE_UNICODE
+    suffix = WIDE_SUFFIX if wide else BURST_SUFFIX
+    sequence = f"type {WIDE_SUFFIX} once" if wide else "mnop Left Left Backspace é Right Delete End z"
     started = time.monotonic()
-    os.write(client.master, BURST)
+    os.write(client.master, WIDE_SUFFIX.encode() if wide else BURST)
     if enabled:
-        client.wait_for(lambda screen: PANEL_TITLE in screen and BURST_SUFFIX in screen, 8, "local reconnect draft suffix")
+        client.wait_for(lambda screen: PANEL_TITLE in screen and suffix in screen, 8, "local reconnect draft suffix")
     else:
         until = time.monotonic() + .4
         while time.monotonic() < until:
             client.pump(.05)
-    return {"sequence": "mnop Left Left Backspace é Right Delete End z", "expected_suffix": BURST_SUFFIX, "visible_ms": round((time.monotonic() - started) * 1000, 2), "panel": panel_state(client, BURST_SUFFIX)}
+    return {"sequence": sequence, "expected_suffix": suffix, "visible_ms": round((time.monotonic() - started) * 1000, 2), "panel": panel_state(client, suffix)}
 
 
 def settle(client, seconds=.6):
@@ -327,12 +387,13 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
     case_dir = root / f"{agent}-{'on' if enabled else 'off'}-{scenario}"
     case_dir.mkdir(mode=0o700)
     config = case_dir / "config.toml"
-    config.write_text(f"onboarding=false\n[remote]\npredict_input=true\nbuffer_reconnect_input={str(enabled).lower()}\nmanage_ssh_config=false\n", encoding="utf-8")
+    config.write_text(f'onboarding=false\n[keys]\nprefix="ctrl+b"\n[remote]\npredict_input=true\nbuffer_reconnect_input={str(enabled).lower()}\nmanage_ssh_config=false\n', encoding="utf-8")
     gate.select(session)
     env = {key: value for key, value in os.environ.items() if not key.startswith("HERDR_")}
     env.update(TERM="xterm-256color", COLORTERM="truecolor", HERDR_CONFIG_PATH=str(config), XDG_CONFIG_HOME=str(case_dir / "config"), XDG_STATE_HOME=str(case_dir / "state"), HERDR_LOG="herdr::client::shell::reconnect_draft=debug")
     client = AgentClient([str(Path(args.binary).resolve()), "--remote", args.target, "--session", session], env, case_dir, agent)
     pane, workdir = None, None
+    offline_suffix = WIDE_SUFFIX if scenario == Scenario.WIDE_UNICODE else BURST_SUFFIX
     case = {"session": session, "agent": agent, "buffer_reconnect_input": enabled, "scenario": scenario, "binary_sha256": binary_digest(args.binary), "submitted_prompt": False, "passed": False}
     try:
         deadline = time.monotonic() + 60
@@ -363,8 +424,15 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
             settle(client, .3)
         case["before_drop"] = require_authoritative(remote, session, pane, expected, agent)
         settle(client)
+        if scenario == Scenario.CLIENT_RESET:
+            os.write(client.master, PREFIX_KEY)
+            client.wait_for(lambda screen: " PREFIX " in screen.splitlines()[-1], 8, "client prefix mode")
+            os.write(client.master, ESCAPE_KEY)
+            client.wait_for(lambda screen: " PREFIX " not in screen.splitlines()[-1], 8, "client-only Escape cancellation")
+            settle(client)
+            case["client_reset"] = {"prefix_observed": True, "escape_cancelled": True, "remote_unchanged": require_authoritative(remote, session, pane, expected, agent)}
         case["first_drop"] = gate.interrupt(client, session)
-        case["first_drop"]["offline_edit"] = offline_burst(client, enabled)
+        case["first_drop"]["offline_edit"] = offline_burst(client, enabled, scenario)
         case["first_drop"]["remote_unchanged_during_gate"] = require_authoritative(remote, session, pane, expected, agent)
         if scenario == Scenario.CHANGED_CONTEXT:
             remote.cli("--session", session, "pane", "send-keys", pane, "ctrl+u")
@@ -372,21 +440,32 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
             expected = CHANGED_DRAFT
             case["context_change"] = require_authoritative(remote, session, pane, expected, agent)
         elif enabled:
-            expected += BURST_SUFFIX
-        client.screen.clear()
+            expected += offline_suffix
+        restoration_started = time.monotonic()
         gate.release()
-        case["restored"] = wait_restored(client, remote, session, pane, expected, agent, cursor_at_end=scenario != Scenario.CHANGED_CONTEXT)
+        if enabled and scenario != Scenario.CHANGED_CONTEXT:
+            case["handoff_panel"] = wait_panel_retired(client, restoration_started)
+        case["restored"] = wait_restored(client, remote, session, pane, expected, agent, cursor_at_end=scenario != Scenario.CHANGED_CONTEXT, deadline=restoration_started + 45, recovery_suffix=offline_suffix)
         settle(client, 1)
         case["settled_once"] = require_authoritative(remote, session, pane, expected, agent)
         if scenario == Scenario.CHANGED_CONTEXT:
             case["retained_panel"] = panel_state(client, BURST_SUFFIX)
             if enabled:
+                if not exact_held_suffix(client, offline_suffix):
+                    raise RuntimeError("Changed editor did not preserve the exact generated recovery suffix")
                 if not all(case["retained_panel"][field] for field in ("present", "generated_suffix_visible")):
                     raise RuntimeError("Changed editor did not retain the local reconnect draft")
                 if not all(case["retained_panel"][field] for field in ("copy_recovery_label_present", "copy_button_visible", "discard_button_visible")):
                     raise RuntimeError("Changed editor did not advertise copy-recovery controls")
+            os.write(client.master, b"K")
+            expected += "K"
+            case["held_online_edit"] = wait_restored(client, remote, session, pane, expected, agent, cursor_at_end=False)
+            if enabled:
+                case["held_suffix_unchanged"] = exact_held_suffix(client, offline_suffix)
+                if not case["held_suffix_unchanged"]:
+                    raise RuntimeError("Online keyboard input altered the held recovery suffix")
         else:
-            if panel_state(client, BURST_SUFFIX)["present"]:
+            if panel_state(client, offline_suffix)["present"]:
                 raise RuntimeError("Successfully restored draft panel remained pending")
             if scenario == Scenario.SECOND_DROP:
                 case["second_drop"] = gate.interrupt(client, session)
@@ -398,9 +477,11 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
                 case["second_drop"]["remote_unchanged_during_gate"] = require_authoritative(remote, session, pane, expected, agent)
                 if enabled:
                     expected += SECOND_SUFFIX
-                client.screen.clear()
+                restoration_started = time.monotonic()
                 gate.release()
-                case["second_restored"] = wait_restored(client, remote, session, pane, expected, agent)
+                if enabled:
+                    case["second_handoff_panel"] = wait_panel_retired(client, restoration_started)
+                case["second_restored"] = wait_restored(client, remote, session, pane, expected, agent, deadline=restoration_started + 45, recovery_suffix=SECOND_SUFFIX)
                 settle(client, 1)
                 case["second_settled_once"] = require_authoritative(remote, session, pane, expected, agent)
             os.write(client.master, b"K")
@@ -413,8 +494,8 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
         if isinstance(error, RestoreFailure):
             case["restore_failure"] = error.diagnosis
     finally:
-        case["final_panel"] = panel_state(client, BURST_SUFFIX)
-        case["final_generated_evidence"] = client.screen.evidence(BASE_DRAFT)
+        case["final_panel"] = panel_state(client, offline_suffix)
+        case["final_generated_evidence"] = generated_evidence(client, BASE_DRAFT)
         owned_events = [event for event in gate.read_events() if event.session == session and event.parent_pid == client.process.pid]
         case["bridge_events"] = [asdict(event) for event in owned_events]
         deliberately_gated = {event.pid for event in owned_events if event.phase == BridgePhase.GATED}
@@ -449,6 +530,27 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
 
 
 def self_test():
+    assert display_width(WIDE_SUFFIX) == 5 and len(WIDE_SUFFIX) == 3
+    screen = CursorScreen("codex")
+    expected = BASE_DRAFT + WIDE_SUFFIX
+    prefix = " " * 27 + "› "
+    editor = prefix + expected
+    editor += " " * (WIDTH - display_width(editor) - 1) + "▐"
+    end = display_width(prefix + expected)
+    screen.feed((f"\x1b[6;1H{editor}\x1b[6;{end + 1}H").encode())
+    assert len(draft_rows(screen.text(), expected, agent="codex", composed=True)) == 1
+    assert exact_draft_cursor(screen, expected)
+    assert not draft_rows(f"› {expected}X", expected, agent="codex")
+    assert not draft_rows(screen.text(), expected + "X", agent="codex", composed=True)
+    screen.feed((f"\x1b[40;28H{PANEL_TITLE} · copy to recover\x1b[40;131H[Discard]\x1b[41;28H{BURST_SUFFIX}").encode())
+
+    class ScreenProbe:
+        def __init__(self, screen):
+            self.screen = screen
+
+    assert exact_held_suffix(ScreenProbe(screen), BURST_SUFFIX)
+    screen.feed(b"K")
+    assert not exact_held_suffix(ScreenProbe(screen), BURST_SUFFIX)
     read_ready = Event()
 
     class PumpProbe:
@@ -519,7 +621,7 @@ def self_test():
             if process.poll() is None:
                 process.terminate()
                 process.wait(timeout=5)
-    print("owned bridge gate, control bypass, foreign-session refusal, release, continuous PTY draining, and bounded structural-only diagnostics assertions passed")
+    print("owned bridge gate, continuous PTY draining, exact wide-Unicode cursor, held suffix, and bounded structural-only diagnostics assertions passed")
 
 
 def main():
