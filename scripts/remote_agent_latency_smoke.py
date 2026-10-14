@@ -21,11 +21,13 @@ unlearned word deletions, unsupported mouse clicks, and burst timing are exclude
 """
 
 import argparse
+from dataclasses import dataclass
 from enum import StrEnum
 import hashlib
 import json
 import os
 from pathlib import Path
+import re
 import shlex
 import statistics
 import subprocess
@@ -44,6 +46,23 @@ EDITOR_STABLE_SECONDS = 6.0
 TRUST_DIALOG_PHRASES = ("do you trust", "trust this folder", "trust the files", "trust the contents", "is this a project you created")
 LOGIN_METHOD_PHRASES = ("select login method", "sign in with chatgpt", "claude account", "login method")
 FOREGROUND_FALLBACK_LABEL = "Run without daemon this time"
+FOREGROUND_CANCEL_LABEL = "Cancel"
+CODEX_UPDATE_CONFIG = "check_for_update_on_startup=false"
+CLAUDE_NO_AUTOUPDATE_ENV = "DISABLE_AUTOUPDATER=1"
+FOREGROUND_OPTION = re.compile(r"\s*(?P<selected>[›❯])?\s*(?P<index>[1-9][0-9]?)\.\s+(?P<label>\S.*?)\s*")
+
+
+class ForegroundFallbackKey(StrEnum):
+    UP = "up"
+    DOWN = "down"
+    ENTER = "enter"
+
+
+@dataclass(frozen=True)
+class ForegroundOption:
+    index: int
+    label: str
+    selected: bool
 
 
 class StableEditorReadiness:
@@ -59,15 +78,49 @@ class StableEditorReadiness:
         return now - self.since >= EDITOR_STABLE_SECONDS
 
 
-def foreground_fallback_key(screen):
-    selected = [line for line in screen.splitlines() if line.lstrip().startswith(("›", "❯"))]
-    if len(selected) != 1:
+def foreground_fallback_options(screen):
+    options = []
+    for line in screen.splitlines():
+        match = FOREGROUND_OPTION.fullmatch(line)
+        if match is not None:
+            options.append(ForegroundOption(int(match["index"]), match["label"], match["selected"] is not None))
+        elif line.lstrip().startswith(("›", "❯")):
+            return None
+    if len({option.index for option in options}) != len(options) or sum(option.selected for option in options) != 1:
         return None
-    if "Cancel" in selected[0]:
-        return "up"
-    if FOREGROUND_FALLBACK_LABEL in selected[0]:
-        return "enter"
-    return None
+    for label in (FOREGROUND_FALLBACK_LABEL, FOREGROUND_CANCEL_LABEL):
+        if sum(option.label == label for option in options) != 1:
+            return None
+        if any(option.label.startswith(label) and option.label != label for option in options):
+            return None
+    return options
+
+
+def foreground_fallback_menu(screen):
+    return foreground_fallback_options(screen) is not None
+
+
+def foreground_fallback_key(screen):
+    options = foreground_fallback_options(screen)
+    if options is None:
+        return None
+    selected = next(option for option in options if option.selected)
+    target = next(option for option in options if option.label == FOREGROUND_FALLBACK_LABEL)
+    if selected.label == FOREGROUND_FALLBACK_LABEL:
+        return ForegroundFallbackKey.ENTER
+    return ForegroundFallbackKey.UP if selected.index > target.index else ForegroundFallbackKey.DOWN
+
+
+def codex_probe_args(workdir):
+    return ["--config", CODEX_UPDATE_CONFIG, "--sandbox", "read-only", "--ask-for-approval", "on-request", "--cd", workdir]
+
+
+def probe_agent_command(agent_bin_dir, agent, binary=None):
+    command = ["env", f"PATH={agent_bin_dir}:/usr/local/bin:/usr/bin:/bin"]
+    if agent == "claude":
+        command.append(CLAUDE_NO_AUTOUPDATE_ENV)
+    command.append(str(binary if binary is not None else Path(agent_bin_dir) / agent))
+    return command
 
 
 class EditOperation(StrEnum):
@@ -187,6 +240,17 @@ def local_editor_ready(screen, agent):
 
 
 def self_test():
+    pinned_claude = "/opt/agents/claude/versions/pinned"
+    claude_command = probe_agent_command("/opt/agents/bin", "claude", pinned_claude)
+    assert CLAUDE_NO_AUTOUPDATE_ENV in claude_command and claude_command[-1] == pinned_claude
+    codex_command = probe_agent_command("/opt/agents/bin", "codex")
+    assert CLAUDE_NO_AUTOUPDATE_ENV not in codex_command and codex_command[-1] == "/opt/agents/bin/codex"
+    generated_cwd = "/tmp/herdr-own-probe"
+    codex_args = codex_probe_args(generated_cwd)
+    assert codex_args.count("--config") == 1 and codex_args[codex_args.index("--config") + 1] == CODEX_UPDATE_CONFIG
+    assert codex_args[codex_args.index("--sandbox") + 1] == "read-only"
+    assert codex_args[codex_args.index("--ask-for-approval") + 1] == "on-request"
+    assert codex_args[codex_args.index("--cd") + 1] == generated_cwd
     scrollbar_row = "› ZQher".ljust(WIDTH - 1) + "▐"
     assert is_draft_row(scrollbar_row, "ZQher", composed=True)
     assert not is_draft_row(scrollbar_row, "ZQher")
@@ -234,10 +298,27 @@ def self_test():
     assert not readiness.observe(True, 7)
     assert not readiness.observe(True, 12.9)
     assert readiness.observe(True, 13)
-    assert foreground_fallback_key("  1. Run without daemon this time\n› 2. Cancel") == "up"
-    assert foreground_fallback_key("› 1. Run without daemon this time\n  2. Cancel") == "enter"
+    assert foreground_fallback_key("  1. Run without daemon this time\n› 2. Cancel") == ForegroundFallbackKey.UP
+    assert foreground_fallback_key("› 1. Run without daemon this time\n  2. Cancel") == ForegroundFallbackKey.ENTER
     assert foreground_fallback_key("  1. Run without daemon this time\n  2. Cancel") is None
     assert foreground_fallback_key("  1. Run without daemon this time\n› 3. Other") is None
+    changed_title_menu = "Background server setup\n  1. Run without daemon this time\n› 2. Cancel"
+    assert foreground_fallback_menu(changed_title_menu)
+    assert foreground_fallback_key(changed_title_menu) == ForegroundFallbackKey.UP
+    assert foreground_fallback_key("Background server setup\n› 1. Run without daemon this time\n  2. Cancel") == ForegroundFallbackKey.ENTER
+    assert not foreground_fallback_menu("Background server setup\n› 1. Run without daemon this time")
+    assert foreground_fallback_key("Background server setup\n  1. Run without daemon this time\n› 2. Cancel and delete") is None
+    assert foreground_fallback_key("Background server setup\n› 1. Run without daemon this time\n❯ 2. Cancel") is None
+    three_options = "Background server setup\n{selected} 1. Run without daemon this time\n{middle} 2. Another option\n{cancel} 3. Cancel"
+    assert foreground_fallback_key(three_options.format(selected=" ", middle=" ", cancel="›")) == ForegroundFallbackKey.UP
+    assert foreground_fallback_key(three_options.format(selected=" ", middle="›", cancel=" ")) == ForegroundFallbackKey.UP
+    assert foreground_fallback_key(three_options.format(selected="›", middle=" ", cancel=" ")) == ForegroundFallbackKey.ENTER
+    assert foreground_fallback_key("› 1. Cancel\n  2. Another option\n  3. Run without daemon this time") == ForegroundFallbackKey.DOWN
+    assert foreground_fallback_key("› 1. Other\n  2. Cancel") is None
+    assert foreground_fallback_key("› x. Other\n  1. Run without daemon this time\n  2. Cancel") is None
+    assert foreground_fallback_key("› 1. Other\n  1. Run without daemon this time\n  2. Cancel") is None
+    assert foreground_fallback_key("  1. Run without daemon this time\n  2. Run without daemon this time\n› 3. Cancel") is None
+    assert foreground_fallback_key("  1. Run without daemon this time\n› 2. Cancel all\n  3. Cancel") is None
     assert local_editor_ready("OpenAI Codex\n› Write a message\n100% context left", "codex")
     assert local_editor_ready("Claude Code\n❯\nplan mode", "claude")
     assert not local_editor_ready("Connecting to remote machine", "codex")
@@ -313,7 +394,7 @@ def wait_for_agent(client, remote, session, pane, agent, workdir, timeout=180):
         client.pump(0)
         lower = screen.lower()
         trust_dialog = any(phrase in lower for phrase in TRUST_DIALOG_PHRASES)
-        if agent == "codex" and any(phrase in lower for phrase in ("cannot use background server", "cannot use the background server")) and FOREGROUND_FALLBACK_LABEL in screen:
+        if agent == "codex" and foreground_fallback_menu(screen):
             readiness.observe(False, time.monotonic())
             # Preserve requested sandbox/approval settings while declining an unavailable daemon.
             key = foreground_fallback_key(screen)
@@ -548,14 +629,14 @@ def run_case(args, remote, agent, prediction, session, artifact_dir):
         response = remote.json("--session", session, "workspace", "create", "--cwd", workdir, "--label", f"smoke-{agent}", "--focus")
         pane = response["result"]["root_pane"]["pane_id"]
         case.update(pane=pane, generated_workdir=workdir)
-        agent_command = ["env", f"PATH={args.agent_bin_dir}:/usr/local/bin:/usr/bin:/bin", str(Path(args.agent_bin_dir) / agent)]
+        agent_command = probe_agent_command(args.agent_bin_dir, agent, args.claude_binary if agent == "claude" else None)
         # Record each installed version separately: the remote user may update
         # an agent between validation runs. This is outside the timing window.
         case["agent_version"] = ssh_command(args, [*agent_command, "--version"]).strip()
         if agent == "claude":
             agent_command += ["--safe-mode", "--permission-mode", "plan"]
         elif agent == "codex":
-            agent_command += ["--sandbox", "read-only", "--ask-for-approval", "on-request", "--cd", workdir]
+            agent_command += codex_probe_args(workdir)
         elif agent == "pi":
             agent_command += ["--no-session"]
         elif agent == "opencode":
@@ -650,6 +731,7 @@ def main():
     parser.add_argument("--binary", default="target/release/herdr")
     parser.add_argument("--remote-binary", default=".local/bin/herdr")
     parser.add_argument("--agent-bin-dir", help="explicit absolute remote directory containing the agent executables")
+    parser.add_argument("--claude-binary", help="optional absolute remote Claude executable to pin the comparison version")
     parser.add_argument("--agents", nargs="+", choices=TEST_AGENTS, default=["claude", "codex"])
     parser.add_argument("--prediction", choices=("off", "on", "both"), default="both")
     parser.add_argument("--samples", type=int, default=5)
@@ -664,6 +746,8 @@ def main():
         parser.error("--target is required for live agent validation")
     if not args.agent_bin_dir or not Path(args.agent_bin_dir).is_absolute():
         parser.error("--agent-bin-dir must be an explicit absolute remote directory")
+    if args.claude_binary is not None and not Path(args.claude_binary).is_absolute():
+        parser.error("--claude-binary must be an absolute remote executable path")
     if not Path(args.binary).is_file() or not 1 <= args.samples <= 20:
         parser.error("binary must exist and samples must be 1-20")
     if args.target.startswith("-") or any(ch.isspace() for ch in args.target):

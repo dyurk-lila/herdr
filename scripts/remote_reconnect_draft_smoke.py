@@ -33,8 +33,10 @@ from remote_agent_latency_smoke import (
     EDIT_KEYS,
     EditOperation,
     binary_digest,
+    codex_probe_args,
     draft_rows as agent_draft_rows,
     own_pane_agent_metadata,
+    probe_agent_command,
     sample_key,
     wait_for_agent,
 )
@@ -357,12 +359,12 @@ def run_case(args, gate, remote, agent, enabled, scenario, root):
         if not re.fullmatch(r"/tmp/herdr-reconnect-draft\.[A-Za-z0-9]+", workdir):
             raise RuntimeError("Unexpected generated diagnostic directory")
         pane = remote.json("--session", session, "workspace", "create", "--cwd", workdir, "--label", "reconnect-draft-smoke", "--focus")["result"]["root_pane"]["pane_id"]
-        command = [str(Path(args.agent_bin_dir) / agent)]
+        command = probe_agent_command(args.agent_bin_dir, agent)
         case["agent_version"] = ssh_text(args.target, [*command, "--version"]).strip()
         if agent == "claude":
             command += ["--safe-mode", "--permission-mode", "plan"]
         else:
-            command += ["--sandbox", "read-only", "--ask-for-approval", "on-request", "--cd", workdir]
+            command += codex_probe_args(workdir)
         remote.cli("--session", session, "pane", "run", pane, shlex.join(command))
         case.update(wait_for_agent(client, remote, session, pane, agent, workdir))
         case["detected_agent"] = own_pane_agent_metadata(remote.json("--session", session, "agent", "list")["result"]["agents"], pane, agent)

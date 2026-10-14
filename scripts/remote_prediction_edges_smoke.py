@@ -111,7 +111,11 @@ def main():
             settle(client, 1)
             if PROMPT not in client.screen.text():
                 os.write(client.master, b"\r")
-            client.wait_for(lambda screen: PROMPT in screen, 15, "edge fixture")
+            client.wait_for(
+                lambda screen: PROMPT in screen and "EDGE_ACK:000000" in screen,
+                15,
+                "edge fixture initial ACK",
+            )
             if no_echo:
                 for index, char in enumerate("generatednoechoprobe", 1):
                     os.write(client.master, char.encode())

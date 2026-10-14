@@ -47,6 +47,29 @@ fn reconnect(state: &mut ClientShellState) {
 }
 
 #[test]
+fn scratchpad_uses_normalized_host_erase_and_committed_text() {
+    let mut state = editor();
+    state.set_host_erase_byte(Some(0x08));
+    state.set_host_reports_all_keys(true);
+    state.set_host_reports_key_releases(true);
+    state.mark_endpoint_disconnected(&ClientEndpointId::Local);
+    assert!(state.handle_input_bytes(b"abc\x08").requests.is_empty());
+    assert!(state
+        .handle_input_bytes("éλ".as_bytes())
+        .requests
+        .is_empty());
+    assert_eq!(state.reconnect_drafts.copy_text(&target()).unwrap(), "abéλ");
+    reconnect(&mut state);
+    let input = state.take_reconnect_draft_input().unwrap();
+    assert!(
+        matches!(&input.request, ClientMessage::ClientShellPaneInput { events, .. }
+        if events == &vec![ClientPaneInputEvent::TextCommit("abéλ".into())])
+    );
+    assert!(state.commit_reconnect_draft_handoff(&input));
+    assert!(!state.has_reconnect_draft());
+}
+
+#[test]
 fn reconnect_draft_panel_covers_remote_mouse_routing_and_retained_patches() {
     let mut state = editor();
     state.mark_endpoint_disconnected(&ClientEndpointId::Local);

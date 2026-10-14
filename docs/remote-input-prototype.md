@@ -1,6 +1,6 @@
 # Remote input prototype
 
-This branch ports [PR #4040](https://github.com/herdrdev/herdr/pull/4040) onto stable Herdr **v0.9.3** (`7b116c05bfda646af39d2524c54e70c751f57ee8`). Original feature source: `7527c76e74def5b0c48749cc7caa33ebbadd7cfc` by itsfabioroma.
+This branch ports [PR #4040](https://github.com/herdrdev/herdr/pull/4040) onto stable Herdr **v0.9.5** (`2ecf19a92fc3a7fff75b6ce3655ef04f4625ec01`). Original feature source: `7527c76e74def5b0c48749cc7caa33ebbadd7cfc` by itsfabioroma.
 
 The local client predicts an ordered sequence of single-cell text, Backspace,
 Delete, Left/Right and End. These operations compose while earlier input is

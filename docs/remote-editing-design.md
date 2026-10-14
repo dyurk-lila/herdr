@@ -2,6 +2,9 @@
 
 The client keeps one active line model and an ordered queue of edit operations.
 Rendering uses its cached projection, never the authoritative terminal buffer.
+The v0.9.5 input pipeline normalizes host erase keys and committed text before
+prediction or scratchpad capture. Remote session preferences remain separate
+from prediction learning, which is shared by destination and agent.
 A changed remote row and cursor must match an exact queue prefix. The earliest
 matching prefix is retired, preserving later speculative operations. Cancelling
 sequences remain ambiguous until a different screen arrives or prediction expires.

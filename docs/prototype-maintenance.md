@@ -99,6 +99,9 @@ prepares a merge and PR.
 If a merge conflicts, resolve it locally on the update branch using the exact
 release commit shown in the run summary, validate it, push that branch, and rerun
 the updater. The updater is scoped to this fork; it opens no upstream PRs.
+Stable release commits may have separate preview-promotion ancestry. Compare
+conflicting paths with the previous stable base: paths unchanged by the fork
+should match the new release exactly; overlay paths must preserve both changes.
 
 Before accepting an update:
 
@@ -119,11 +122,18 @@ Before accepting an update:
    fallbacks, unsupported clicks and disconnect behavior. Profile pane scaling
    when render paths change. Record agent versions, binary/source IDs and limits;
    keep workspace targets, credentials and raw diagnostics out of the public fork.
+   Probe invocations disable agent update checks; `--claude-binary` can pin a
+   native Claude executable when its installed symlink changes. Compare matching
+   agent versions and binary hashes before accepting latency results.
 5. Preserve the weekly/manual updater on the default prototype branch, its
    verified stable-tag input, no-force-push/no-auto-merge behavior and the fork CI
    branch trigger. Merge only after validation; then rebuild the local client.
 
 ## Rebuild after merging
+
+Use this fork's updater and rebuild workflow for prototype upgrades. The built-in
+`herdr-proto update` command uses upstream release manifests and can replace the
+prototype executable with regular Herdr.
 
 Install the Rust version from `rust-toolchain.toml` and the Zig version required
 by the merged vendored Ghostty source, then run `just check`. Build an identifiable

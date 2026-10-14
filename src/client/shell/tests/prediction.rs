@@ -46,25 +46,28 @@ pub(super) fn echo(state: &mut ClientShellState, text: &str) {
 
 #[test]
 fn remote_backspace_is_predicted_and_forwarded_once_while_typing_echo_is_in_flight() {
-    let mut state = remote_shell(true, true);
-    state.handle_input_bytes(b"a");
-    echo(&mut state, "a");
-    state.handle_input_bytes(b"bc");
-    assert_eq!(visible_prefix(&mut state, 4), "abc ");
-    let deletion = state.handle_input_bytes(b"\x7f");
-    assert_eq!(deletion.requests.len(), 1);
-    assert!(deletion.repaint);
-    assert_eq!(visible_prefix(&mut state, 4), "ab  ");
-    assert_eq!(
-        state.pane_surface.as_ref().unwrap().frame.cells[1].symbol,
-        " "
-    );
-    echo(&mut state, "abc");
-    assert_eq!(visible_prefix(&mut state, 4), "ab  ");
-    echo(&mut state, "ab");
-    assert!(!state.input_prediction.has_pending());
-    state.handle_input_bytes(b"d");
-    assert_eq!(visible_prefix(&mut state, 4), "abd ");
+    for (erase, backspace) in [(None, b"\x7f"), (Some(0x08), b"\x08")] {
+        let mut state = remote_shell(true, true);
+        state.set_host_erase_byte(erase);
+        state.handle_input_bytes(b"a");
+        echo(&mut state, "a");
+        state.handle_input_bytes(b"bc");
+        assert_eq!(visible_prefix(&mut state, 4), "abc ");
+        let deletion = state.handle_input_bytes(backspace);
+        assert_eq!(deletion.requests.len(), 1);
+        assert!(deletion.repaint);
+        assert_eq!(visible_prefix(&mut state, 4), "ab  ");
+        assert_eq!(
+            state.pane_surface.as_ref().unwrap().frame.cells[1].symbol,
+            " "
+        );
+        echo(&mut state, "abc");
+        assert_eq!(visible_prefix(&mut state, 4), "ab  ");
+        echo(&mut state, "ab");
+        assert!(!state.input_prediction.has_pending());
+        state.handle_input_bytes(b"d");
+        assert_eq!(visible_prefix(&mut state, 4), "abd ");
+    }
 }
 
 #[test]
