@@ -24,6 +24,13 @@ prior art.
 
 The port preserves stable graphics composition, keybinding routing and connection-generation fencing. Primary remote connections also recover through the endpoint supervisor while preserving the remote panes. It uses the existing generation-one endpoint contract with an unchanged stable remote server. No UDP transport is required.
 
+The prototype features run in the local client; remote machines can run official
+Herdr. Bootstrap reuses a compatible remote installation or downloads the official
+stable asset matching `BASE_VERSION`, with the normal protocol and checksum checks.
+It never copies the local prototype binary by default, even to the same platform.
+An explicit `HERDR_REMOTE_BINARY` override remains available. Stable and preview
+clients retain upstream installation behavior.
+
 ## Build and enable
 
 Install the dependencies described by the repository's normal build instructions, then:

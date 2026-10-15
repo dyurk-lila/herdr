@@ -660,11 +660,27 @@ struct RemoteManifestReleaseRef<'a> {
 }
 
 fn current_version() -> String {
-    crate::build_info::version()
+    remote_install_version_for(crate::build_info::channel(), crate::build_info::version())
 }
 
 fn current_channel() -> &'static str {
-    crate::build_info::channel()
+    remote_install_channel_for(crate::build_info::channel())
+}
+
+fn remote_install_version_for(channel: &str, local_version: String) -> String {
+    if channel == crate::build_info::PROTOTYPE_CHANNEL {
+        crate::build_info::BASE_VERSION.to_string()
+    } else {
+        local_version
+    }
+}
+
+fn remote_install_channel_for(channel: &str) -> &str {
+    if channel == crate::build_info::PROTOTYPE_CHANNEL {
+        "stable"
+    } else {
+        channel
+    }
 }
 
 struct InstallSource {
@@ -1895,18 +1911,22 @@ fn resolve_install_source(
         return Ok(InstallSource::persistent(path));
     }
 
-    if *platform == RemotePlatform::local() {
-        let path = std::env::current_exe()?;
-        if !crate::update::is_package_manager_managed_exe_path(&path) {
-            return Ok(InstallSource::persistent(path));
-        }
+    if local_binary_can_seed_remote(platform) {
+        return Ok(InstallSource::persistent(std::env::current_exe()?));
     }
 
     download_release_asset(platform)
 }
 
 fn local_binary_can_seed_remote(platform: &RemotePlatform) -> bool {
-    if platform.is_windows() || *platform != RemotePlatform::local() {
+    local_binary_can_seed_remote_for(platform, crate::build_info::channel())
+}
+
+fn local_binary_can_seed_remote_for(platform: &RemotePlatform, channel: &str) -> bool {
+    if channel == crate::build_info::PROTOTYPE_CHANNEL
+        || platform.is_windows()
+        || *platform != RemotePlatform::local()
+    {
         return false;
     }
 
@@ -5689,6 +5709,50 @@ function Get-Process {
             "--expected-protocol {CURRENT_PROTOCOL} --expected-version {}",
             current_version()
         )));
+    }
+
+    #[test]
+    fn prototype_remote_install_uses_official_base_release() {
+        let channel = crate::build_info::PROTOTYPE_CHANNEL;
+        let version = remote_install_version_for(channel, "1.2.3-proto.custom".to_string());
+        assert_eq!(version, crate::build_info::BASE_VERSION);
+        assert_eq!(remote_install_channel_for(channel), "stable");
+
+        let manifest: RemoteUpdateManifest = serde_json::from_value(serde_json::json!({
+            "version": crate::build_info::BASE_VERSION,
+            "protocol": CURRENT_PROTOCOL,
+            "assets": {"linux-x86_64": {"url": "https://example.com/stable", "sha256": "checksum"}}
+        }))
+        .unwrap();
+        let release = manifest.release_for_version(&version).unwrap();
+        assert_eq!(release.protocol, Some(CURRENT_PROTOCOL));
+        assert_eq!(
+            release.assets["linux-x86_64"].url(),
+            "https://example.com/stable"
+        );
+    }
+
+    #[test]
+    fn nonprototype_remote_install_preserves_build_identity() {
+        for (channel, version) in [
+            ("stable", "1.2.3"),
+            ("preview", "1.2.3-preview.exact-build"),
+            ("custom", "1.2.3-custom.exact-build"),
+        ] {
+            assert_eq!(
+                remote_install_version_for(channel, version.to_string()),
+                version
+            );
+            assert_eq!(remote_install_channel_for(channel), channel);
+        }
+    }
+
+    #[test]
+    fn prototype_build_never_seeds_remote_with_local_binary() {
+        assert!(!local_binary_can_seed_remote_for(
+            &RemotePlatform::local(),
+            crate::build_info::PROTOTYPE_CHANNEL,
+        ));
     }
 
     #[test]

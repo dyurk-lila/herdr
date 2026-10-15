@@ -26,7 +26,7 @@ pub fn app_dir_name() -> &'static str {
 fn app_dir_name_for(channel: &str, debug: bool) -> &'static str {
     match (channel, debug) {
         (_, true) => "herdr-dev",
-        ("proto", false) => "herdr-proto",
+        (crate::build_info::PROTOTYPE_CHANNEL, false) => "herdr-proto",
         (_, false) => "herdr",
     }
 }
