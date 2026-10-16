@@ -53,6 +53,7 @@ client, or set its configuration explicitly:
 ```toml
 [remote]
 predict_input = true
+buffer_reconnect_input = true # optional local drafts during reconnect
 ```
 
 Connect with `herdr-proto --remote YOUR_SSH_ALIAS --session YOUR_SESSION`, or save
@@ -112,6 +113,22 @@ matching echoes are evidence, not a
 permission guarantee. An unexpected predicted echo invalidates that machine/agent
 profile; input itself is always forwarded once, regardless of prediction.
 
-Disconnected input is discarded in this layer. The second stacked PR adds
-optional local scratchpads; neither layer provides acknowledged replay.
-[Prototype maintenance](prototype-maintenance.md) describes future update constraints.
+With `buffer_reconnect_input`, detected outages open an editable local reconnect
+scratchpad. Editing continues through the entire reconnect handshake. After
+activation commits, all never-sent scratchpad text enters the target pane's
+normal input queue, independently of prediction training, previous unconfirmed
+input, changed editor contents and readiness labels. Successful queue admission
+clears the scratchpad immediately and restores normal agent input and cursor;
+failed admission retains unsent text. There are no Copy/Discard controls or
+manual recovery mode. An open server terminal popup temporarily defers pane
+input; closing it automatically flushes the scratchpad. Accepted text is never
+replayed on a later loss.
+
+Wide/wrapped Unicode suffixes can transfer without inline projection. Drafts are
+bounded, client-local and volatile. Editing applies to the never-sent suffix;
+Enter and unsupported controls are not queued. Text is inserted into the current
+editor even if its application or prompt changed during the outage. See
+[offline typing](../OFFLINE_TYPING.md) for routing and delivery limits.
+Reliable resumable delivery still requires server acknowledgements.
+[Prototype maintenance](prototype-maintenance.md) describes keeping these
+constraints through later stable releases.

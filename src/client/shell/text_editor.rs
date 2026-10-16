@@ -41,6 +41,10 @@ impl TextEditor {
         &self.text
     }
 
+    pub(super) fn cursor_position(&self) -> usize {
+        self.cursor
+    }
+
     pub fn clear(&mut self) {
         self.text.clear();
         self.cursor = 0;

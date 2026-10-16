@@ -1065,6 +1065,9 @@ pub struct RemoteConfig {
     /// Predict supported remote pane edits after observing matching echo. Default: true.
     /// Unconfirmed text is underlined; applications can change their echo behavior.
     pub predict_input: bool,
+    /// Keep a local draft during reconnect and hand it off when pane input is ready.
+    /// Queue admission is not a remote delivery acknowledgement. Default: false.
+    pub buffer_reconnect_input: bool,
 }
 
 impl Default for RemoteConfig {
@@ -1072,6 +1075,7 @@ impl Default for RemoteConfig {
         Self {
             manage_ssh_config: true,
             predict_input: true,
+            buffer_reconnect_input: false,
         }
     }
 }
