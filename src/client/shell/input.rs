@@ -228,12 +228,16 @@ impl ClientShellState {
         }
         for event in events {
             let event = match event {
-                RawInputEvent::Key(key) => match self.host_text_commit(&key) {
-                    Some(text) => RawInputEvent::Text(crate::input::TextCommit::new(text)),
-                    None => RawInputEvent::Key(key),
-                },
+                RawInputEvent::Key(key) => {
+                    let key = self.host_erase_key(key);
+                    match self.host_text_commit(&key) {
+                        Some(text) => RawInputEvent::Text(crate::input::TextCommit::new(text)),
+                        None => RawInputEvent::Key(key),
+                    }
+                }
                 other => other,
             };
+            self.prepare_prediction_input(&event, &mut outcome);
             if self.handle_machine_badge_event(&event, &mut outcome) {
                 continue;
             }
@@ -241,10 +245,7 @@ impl ClientShellState {
                 push_host_theme_update(&mut outcome.requests, update);
             }
             match event {
-                RawInputEvent::Key(key) => {
-                    let key = self.host_erase_key(key);
-                    self.handle_key(key, &mut outcome)
-                }
+                RawInputEvent::Key(key) => self.handle_key(key, &mut outcome),
                 RawInputEvent::Text(text) => {
                     let text = text.into_string();
                     if matches!(
@@ -370,6 +371,9 @@ impl ClientShellState {
                 | RawInputEvent::Unsupported => {}
             }
             self.reconcile_input_source();
+            if !self.prediction_allowed() {
+                outcome.repaint |= self.input_prediction.clear();
+            }
         }
         outcome.repaint |= self.resume_mobile_switcher_if_ready();
         outcome
@@ -1172,19 +1176,26 @@ impl ClientShellState {
     }
 
     fn push_pane_key(
-        &self,
+        &mut self,
         target: ClientInputTarget,
         key: crate::input::TerminalKey,
         outcome: &mut ClientShellInput,
     ) {
         if let Some(event) = ClientPaneInputEvent::from_terminal_key(key) {
+            self.predict_pane_event(&target, &event, outcome);
             super::push_target_event(target, event, outcome);
         }
     }
 
-    fn push_focused_pane_event(&self, event: ClientPaneInputEvent, outcome: &mut ClientShellInput) {
+    fn push_focused_pane_event(
+        &mut self,
+        event: ClientPaneInputEvent,
+        outcome: &mut ClientShellInput,
+    ) {
         if let Some(pane_id) = self.focused_pane_id() {
-            super::push_target_event(ClientInputTarget::Pane(pane_id), event, outcome);
+            let target = ClientInputTarget::Pane(pane_id);
+            self.predict_pane_event(&target, &event, outcome);
+            super::push_target_event(target, event, outcome);
         }
     }
 }

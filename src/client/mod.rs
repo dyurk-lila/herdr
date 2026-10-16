@@ -31,6 +31,7 @@ mod image_files;
 mod input;
 mod loop_config;
 mod notifications;
+mod prediction_store;
 mod shell;
 mod shell_runtime;
 mod startup;
@@ -499,6 +500,14 @@ async fn run_client_loop(
         shell.set_host_erase_byte(crate::platform::terminal_erase_byte());
         shell.set_graphics_cell_size(initial_cell_width_px, initial_cell_height_px);
         shell.set_endpoint_catalog(&endpoint_catalog.ssh);
+        if is_remote_client {
+            shell.set_primary_endpoint_label("Remote");
+            if let Ok(target) = std::env::var(crate::remote::REMOTE_PREDICTION_TARGET_ENV_VAR) {
+                if crate::remote::validate_remote_target(&target).is_ok() {
+                    shell.set_primary_prediction_target(&target);
+                }
+            }
+        }
         shell.set_endpoint_methods_for(
             &endpoint::ClientEndpointId::Local,
             initial
@@ -524,6 +533,8 @@ async fn run_client_loop(
         }
     }
     let host_mouse_capture_active = Arc::new(AtomicBool::new(state.mouse_capture_active));
+    let mut prediction_store = None;
+    let mut prediction_store_startup = prediction_store::StoreStartup::default();
     // Cell size reported by the host terminal, packed as width<<32 | height.
     // Zero means the host has not reported one.
     let reported_cell_size = Arc::new(AtomicU64::new(0));
@@ -642,12 +653,27 @@ async fn run_client_loop(
     };
     let mut supervisors =
         endpoint::EndpointSupervisors::new(&endpoint_catalog.ssh, std::time::Instant::now());
-    if federated {
+    // A --remote client uses the primary endpoint's local SSH bridge socket. The bridge
+    // accepts another connection after SSH exits, so the existing supervisor can recover
+    // it without replaying input or restarting the remote panes. Older generation-1 servers
+    // remain attachable; coherent recovery requires their optional surface/fence support.
+    let primary_remote_recovery = is_remote_client
+        && state.shell.is_some()
+        && write_stream
+            .connection(&endpoint::ClientEndpointId::Local)
+            .is_some_and(|connection| connection.negotiation.supports_surface_interest());
+    if federated || primary_remote_recovery {
         supervisors.add_local(
             client_socket_path(),
             write_stream
                 .connection(&endpoint::ClientEndpointId::Local)
                 .map(|connection| connection.generation),
+            std::time::Instant::now(),
+        );
+    }
+    if primary_remote_recovery {
+        write_stream.enable_remote_health(
+            &endpoint::ClientEndpointId::Local,
             std::time::Instant::now(),
         );
     }
@@ -680,6 +706,35 @@ async fn run_client_loop(
     #[cfg(windows)]
     let mut stdin_open = true;
     while !should_quit.load(Ordering::Acquire) {
+        if let Some(shell) = state.shell.as_mut() {
+            if prediction_store_startup
+                .should_start(shell.prediction_enabled(), prediction_store.is_some())
+            {
+                let path =
+                    crate::config::state_dir().join("client/prediction-profiles/profiles.json");
+                match prediction_store::ProfileStore::start(path) {
+                    Ok((profiles, store)) => {
+                        shell.initialize_prediction_profiles(profiles);
+                        prediction_store = Some(store);
+                    }
+                    Err(error) => {
+                        tracing::debug!(%error, "editor learning persistence is unavailable")
+                    }
+                }
+            }
+        }
+        if let (Some(shell), Some(store)) = (state.shell.as_mut(), prediction_store.as_mut()) {
+            for update in shell.take_prediction_profile_updates() {
+                let resume_epoch = update.epoch().saturating_add(1);
+                if !store.enqueue(update) {
+                    state.repaint_pending |=
+                        shell.pause_prediction_profiles_until_epoch(resume_epoch);
+                }
+            }
+            if let Some(profiles) = store.take_latest() {
+                state.repaint_pending |= shell.initialize_prediction_profiles(profiles);
+            }
+        }
         if pending_activation.is_none() {
             if let Some(reload) = pending_catalog.take() {
                 match reload {
@@ -1405,6 +1460,9 @@ async fn run_client_loop(
                         negotiation,
                         false,
                     );
+                    if primary_remote_recovery && endpoint_id.is_local() {
+                        write_stream.enable_remote_health(&endpoint_id, now);
+                    }
                     if let Some(frame) = frame {
                         state.present_frame(frame);
                     }
@@ -1430,8 +1488,10 @@ async fn run_client_loop(
                 if !endpoint_catalog.select_endpoint(&endpoint_id) {
                     continue;
                 }
-                if let Err(error) = endpoint_catalog.store_selection() {
-                    warn!(%error, "failed to persist desired endpoint selection");
+                if !is_remote_client {
+                    if let Err(error) = endpoint_catalog.store_selection() {
+                        warn!(%error, "failed to persist desired endpoint selection");
+                    }
                 }
                 begin_endpoint_activation(
                     &mut state,
@@ -2275,7 +2335,7 @@ async fn run_client_loop(
                         error = %failure.message,
                         "endpoint transport failed"
                     );
-                    if !federated && failure.endpoint_id.is_local() {
+                    if !federated && !primary_remote_recovery && failure.endpoint_id.is_local() {
                         return Err(ClientError::ConnectionLost(io::Error::new(
                             failure.kind,
                             failure.message,
@@ -2349,7 +2409,8 @@ async fn run_client_loop(
                         outcome.repaint |= notification_repaint
                             | shell.tick_copy_feedback(now)
                             | shell.tick_workspace_highlight(now)
-                            | shell.tick_endpoint_error(now);
+                            | shell.tick_endpoint_error(now)
+                            | shell.tick_prediction(now);
                         let frame = outcome
                             .repaint
                             .then(|| shell.compose(state.reported_size.0, state.reported_size.1))

@@ -331,12 +331,21 @@ fn load_selection_from_path(path: &Path) -> Result<Option<EndpointSelection>, St
     Ok(Some(selection))
 }
 
-pub(super) fn store_private_json(
+pub(crate) fn store_private_json(
     path: &Path,
     content: &[u8],
     description: &str,
 ) -> Result<(), String> {
-    if content.len() as u64 > MAX_CATALOG_BYTES {
+    store_private_json_with_limit(path, content, description, MAX_CATALOG_BYTES)
+}
+
+pub(crate) fn store_private_json_with_limit(
+    path: &Path,
+    content: &[u8],
+    description: &str,
+    max_bytes: u64,
+) -> Result<(), String> {
+    if content.len() as u64 > max_bytes {
         return Err(format!("{description} exceeds the storage limit"));
     }
     let parent = path

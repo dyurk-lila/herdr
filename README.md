@@ -1,5 +1,10 @@
 # herdr
 
+This fork's `dyurk/predictive-typing` branch adds remote typing prediction
+(on by default; Settings → Typing) and composed edits, with learning shared across agent sessions. See the
+[feature guide](docs/remote-input-prototype.md), [editing design](docs/remote-editing-design.md),
+and [stack update contract](docs/prototype-maintenance.md).
+
 
 <p align="center">
   <img src="assets/logo.png" alt="herdr" width="100" />
