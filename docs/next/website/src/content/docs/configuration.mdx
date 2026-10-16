@@ -118,11 +118,14 @@ Remote attach manages its SSH connection with temporary keepalives and, where su
 [remote]
 manage_ssh_config = true
 predict_input = true
+buffer_reconnect_input = false
 ```
 
 When enabled, `herdr --remote` writes a private temporary SSH config that includes your user and system SSH configs first, then adds fallback `ServerAliveInterval` and `ServerAliveCountMax` values. Your own keepalive settings win. Linux and macOS clients also use a private per-attach OpenSSH control socket to reuse the first authenticated connection; Windows OpenSSH does not. Set `manage_ssh_config = false` to run remote attach through plain `ssh` without Herdr's generated config or control socket.
 
 Local echo for remote pane typing is on by default, including saved SSH machines. Toggle **Settings → Typing → On/Off** or set `[remote].predict_input` in the local client config. Changes apply immediately without a remote reconnect or server upgrade. After matching remote echoes, Herdr predicts ordered single-row insertion, Backspace/Delete, Left/Right/End, simple single-cell Unicode, learned Ctrl-W/Alt-Backspace and eligible same-row clicks. Operations compose while earlier input awaits echo; uncertain geometry, wrapping, wide/combining text, selection, paste and unsupported operations use authoritative rendering. Exact prompt and editor behavior learning is shared by SSH destination and agent across sessions and client restarts, without storing draft text. Activity/readiness labels are advisory. Unconfirmed cells are underlined, expire after 750 ms, and never modify authoritative pane content or clipboard reads. Input is always sent once; screen matching does not acknowledge transport delivery or authorize replay.
+
+Set `buffer_reconnect_input = true` to keep an editable local scratchpad during detected remote reconnects, independently of prediction training. After committed pane-input readiness, all never-sent text enters the target pane queue and the temporary panel clears automatically. Changed editors and earlier unconfirmed input do not block handoff. Drafts are volatile, bounded, and never submit Enter or other controls; queue admission is best effort, not a remote acknowledgement.
 
 The current endpoint protocol does not report whether the remote application permits echo. Waiting for observed echo and resetting on Enter protects ordinary password prompts, but an application that changes echo behavior within a line can still briefly show unexpected input. Disable prediction for workflows that require strictly authoritative display. Command execution, completion, and new output still wait for the remote host.
 

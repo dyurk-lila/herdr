@@ -4,6 +4,8 @@ This fork's `dyurk/predictive-typing` branch adds remote typing prediction
 (on by default; Settings → Typing) and composed edits, with learning shared across agent sessions. See the
 [feature guide](docs/remote-input-prototype.md), [editing design](docs/remote-editing-design.md),
 and [stack update contract](docs/prototype-maintenance.md).
+The stacked `dyurk/reconnect-scratchpad` branch adds [temporary outage drafts](OFFLINE_TYPING.md)
+that transfer automatically once pane input is ready. Delivery remains best effort.
 
 
 <p align="center">

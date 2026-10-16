@@ -1471,6 +1471,12 @@
           "type": "boolean",
           "default": "true",
           "description": "Enable conservative local echo for remote panes after matching server echo. Unconfirmed single-cell text and supported composed edits are underlined; uncertain output and context changes reset prediction. Echo permission is not available in the current protocol, so applications that change echo behavior can briefly display unexpected input."
+        },
+        {
+          "key": "remote.buffer_reconnect_input",
+          "type": "boolean",
+          "default": "false",
+          "description": "Keep a bounded, volatile local draft during remote reconnects. After committed pane-input readiness, automatically transfer all never-sent text and clear the scratchpad, independently of prediction training or changed editor contents. Failed queue admission retains unsent text; accepted text is never replayed. Enter and other controls are not queued. Queue admission is not remote acknowledgement."
         }
       ]
     },

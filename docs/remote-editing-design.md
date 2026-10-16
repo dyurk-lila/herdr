@@ -3,7 +3,7 @@
 The client keeps one active line model and an ordered queue of edit operations.
 Rendering uses its cached projection, never the authoritative terminal buffer.
 The v0.9.5 input pipeline normalizes host erase keys and committed text before
-prediction. Remote session preferences remain separate
+prediction or scratchpad capture. Remote session preferences remain separate
 from prediction learning, which is shared by destination and agent.
 A changed remote row and cursor must match an exact queue prefix. The earliest
 matching prefix is retired, preserving later speculative operations. Cancelling
@@ -71,5 +71,5 @@ checks and changes the ordinary direct-editing interaction.
 it does not acknowledge editor processing or provide application-level replay
 safety after a replacement connection. A negotiated server extension with input
 IDs, deduplication, context identity and an echo watermark would remove the main
-reconciliation ambiguity. Reliable disconnected delivery requires a separately
-negotiated capability; generation-one codecs remain unchanged.
+reconciliation ambiguity. Reliable disconnected typing remains scoped in
+[OFFLINE_TYPING.md](../OFFLINE_TYPING.md), rather than changing generation-one codecs.

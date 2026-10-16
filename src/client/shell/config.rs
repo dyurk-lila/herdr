@@ -117,6 +117,7 @@ impl ClientShellConfig {
         let theme_runtime = crate::app::client_theme_runtime_from_config(config);
         Self {
             remote_predict_input: config.remote.predict_input,
+            remote_buffer_reconnect_input: config.remote.buffer_reconnect_input,
             sidebar_width: config.ui.sidebar_width,
             sidebar_min_width: config.ui.sidebar_min_width,
             sidebar_max_width: config.ui.sidebar_max_width,
@@ -321,6 +322,7 @@ impl ClientShellConfig {
 
         if !invalid_section("remote") {
             self.remote_predict_input = config.remote.predict_input;
+            self.remote_buffer_reconnect_input = config.remote.buffer_reconnect_input;
         }
 
         if !invalid_section("keys")

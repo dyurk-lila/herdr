@@ -144,7 +144,10 @@ impl ClientShellState {
                 &self.config.palette,
             );
         }
-        FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[])
+        let mut frame = FrameData::from_ratatui_buffer_with_hyperlinks(&buffer, None, &[]);
+        let mut occlusion = crate::kitty_graphics::surface::Occlusion::default();
+        self.render_reconnect_draft(&mut frame, layout.pane_surface, &mut occlusion);
+        frame
     }
 
     pub(crate) fn compose(
@@ -730,6 +733,7 @@ impl ClientShellState {
             self.hits.pane_splits.clear();
             self.hits.popup = None;
         }
+        self.render_reconnect_draft(&mut frame, layout.pane_surface, &mut occlusion);
         let graphics = self.compose_graphics(layout, &occlusion);
         Some(crate::client::frame_output::ComposedFrame { frame, graphics })
     }
