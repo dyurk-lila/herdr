@@ -698,11 +698,27 @@ struct RemoteManifestReleaseRef<'a> {
 }
 
 fn current_version() -> String {
-    crate::build_info::version()
+    remote_install_version_for(crate::build_info::channel(), crate::build_info::version())
 }
 
 fn current_channel() -> &'static str {
-    crate::build_info::channel()
+    remote_install_channel_for(crate::build_info::channel())
+}
+
+fn remote_install_version_for(channel: &str, local_version: String) -> String {
+    if channel == crate::build_info::PROTOTYPE_CHANNEL {
+        crate::build_info::BASE_VERSION.to_string()
+    } else {
+        local_version
+    }
+}
+
+fn remote_install_channel_for(channel: &str) -> &str {
+    if channel == crate::build_info::PROTOTYPE_CHANNEL {
+        "stable"
+    } else {
+        channel
+    }
 }
 
 struct InstallSource {
@@ -1399,7 +1415,7 @@ fn decode_windows_remote_path(encoded: &str) -> io::Result<String> {
     Ok(path)
 }
 
-fn apply_noninteractive_ssh_options(command: &mut Command) {
+fn apply_noninteractive_ssh_auth_options(command: &mut Command) {
     command
         .arg("-o")
         .arg("BatchMode=yes")
@@ -1410,7 +1426,12 @@ fn apply_noninteractive_ssh_options(command: &mut Command) {
         .arg("-o")
         .arg("ConnectTimeout=10")
         .arg("-o")
-        .arg("ConnectionAttempts=1")
+        .arg("ConnectionAttempts=1");
+}
+
+fn apply_noninteractive_ssh_options(command: &mut Command) {
+    apply_noninteractive_ssh_auth_options(command);
+    command
         .arg("-o")
         .arg("ServerAliveInterval=15")
         .arg("-o")
@@ -2123,18 +2144,22 @@ fn resolve_install_source(
         return Ok(InstallSource::persistent(path));
     }
 
-    if *platform == RemotePlatform::local() {
-        let path = std::env::current_exe()?;
-        if !crate::update::is_package_manager_managed_exe_path(&path) {
-            return Ok(InstallSource::persistent(path));
-        }
+    if local_binary_can_seed_remote(platform) {
+        return Ok(InstallSource::persistent(std::env::current_exe()?));
     }
 
     download_release_asset(platform)
 }
 
 fn local_binary_can_seed_remote(platform: &RemotePlatform) -> bool {
-    if platform.is_windows() || *platform != RemotePlatform::local() {
+    local_binary_can_seed_remote_for(platform, crate::build_info::channel())
+}
+
+fn local_binary_can_seed_remote_for(platform: &RemotePlatform, channel: &str) -> bool {
+    if channel == crate::build_info::PROTOTYPE_CHANNEL
+        || platform.is_windows()
+        || *platform != RemotePlatform::local()
+    {
         return false;
     }
 
@@ -3000,6 +3025,39 @@ pub(super) struct SshStdioBridge {
     thread: Option<JoinHandle<()>>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum BridgeSshPolicy {
+    Interactive,
+    SavedEndpoint,
+    PrimaryReconnect,
+}
+
+impl BridgeSshPolicy {
+    fn for_connection(noninteractive: bool, first_connection: bool) -> Self {
+        if noninteractive {
+            Self::SavedEndpoint
+        } else if first_connection {
+            Self::Interactive
+        } else {
+            Self::PrimaryReconnect
+        }
+    }
+
+    fn is_noninteractive(self) -> bool {
+        self != Self::Interactive
+    }
+
+    fn apply_options(self, command: &mut Command) {
+        match self {
+            Self::Interactive => {}
+            Self::SavedEndpoint => apply_noninteractive_ssh_options(command),
+            // Preserve the primary attach's user-configured keepalives, including
+            // managed fallback precedence, while disallowing raw-terminal prompts.
+            Self::PrimaryReconnect => apply_noninteractive_ssh_auth_options(command),
+        }
+    }
+}
+
 impl SshStdioBridge {
     pub(super) fn start(
         target: String,
@@ -3054,21 +3112,27 @@ impl SshStdioBridge {
         let thread_ssh_options = ssh_options.cloned();
         let (failure_tx, failure_rx) = mpsc::sync_channel(1);
         let thread = thread::spawn(move || {
+            let mut first_connection = true;
             while !thread_stop.load(Ordering::Acquire) {
                 match listener.accept() {
                     Ok(stream) => {
+                        // Reconnect workers run while the client owns a raw terminal.
+                        // Only the first interactive attach may prompt for authentication.
+                        let policy =
+                            BridgeSshPolicy::for_connection(noninteractive, first_connection);
+                        first_connection = false;
                         if let Err(err) = bridge_connection(
                             stream,
                             &target,
                             &remote_command,
                             thread_ssh_options.as_ref(),
-                            noninteractive,
+                            policy,
                             &thread_stop,
                         ) {
                             let _ =
                                 failure_tx.try_send(io::Error::new(err.kind(), err.to_string()));
-                            if noninteractive {
-                                tracing::warn!(error = %err, "saved SSH endpoint bridge failed");
+                            if policy.is_noninteractive() {
+                                tracing::warn!(error = %err, "SSH endpoint bridge failed");
                             } else {
                                 eprintln!("herdr: remote bridge failed: {err}");
                             }
@@ -3260,14 +3324,13 @@ fn bridge_connection(
     target: &str,
     remote_command: &str,
     ssh_options: Option<&ManagedSshOptions>,
-    noninteractive: bool,
+    policy: BridgeSshPolicy,
     bridge_stop: &Arc<AtomicBool>,
 ) -> io::Result<()> {
     let mut command = Command::new("ssh");
     apply_managed_ssh_options(&mut command, ssh_options);
-    if noninteractive {
-        apply_noninteractive_ssh_options(&mut command);
-    }
+    policy.apply_options(&mut command);
+    let noninteractive = policy.is_noninteractive();
     command
         .arg("-T")
         .arg(target)
@@ -3623,6 +3686,7 @@ fn configure_remote_client_environment(
             local_socket,
         )
         .env(REMOTE_PREFERENCES_ENV_VAR, preference_identity)
+        .env(super::REMOTE_PREDICTION_TARGET_ENV_VAR, target)
         .env(REATTACH_COMMAND_ENV_VAR, reattach_command)
         .env(REMOTE_KEYBINDINGS_ENV_VAR, keybindings.as_str())
         .env_remove(crate::api::SOCKET_PATH_ENV_VAR);
@@ -3794,6 +3858,41 @@ mod tests {
             "cleanup waited for or killed the independent holder"
         );
         assert!(String::from_utf8_lossy(&output).contains("final child output"));
+    }
+
+    #[test]
+    fn remote_client_prediction_identity_is_shared_across_sessions() {
+        for session in ["first", "second"] {
+            let mut command = Command::new("herdr-proto");
+            command.env(super::super::REMOTE_PREDICTION_TARGET_ENV_VAR, "stale");
+            configure_remote_client_environment(
+                &mut command,
+                Path::new("bridge.sock"),
+                "reattach",
+                RemoteKeybindings::Local,
+                "shared-destination",
+                session,
+            )
+            .unwrap();
+            let variable = |name: &str| {
+                command
+                    .get_envs()
+                    .find_map(|(key, value)| (key == name).then_some(value))
+                    .flatten()
+                    .unwrap()
+                    .to_str()
+                    .unwrap()
+            };
+            assert_eq!(
+                variable(super::super::REMOTE_PREDICTION_TARGET_ENV_VAR),
+                "shared-destination"
+            );
+            assert_eq!(
+                serde_json::from_str::<(String, String)>(variable(REMOTE_PREFERENCES_ENV_VAR))
+                    .unwrap(),
+                ("shared-destination".into(), session.into())
+            );
+        }
     }
 
     #[test]
@@ -4517,6 +4616,61 @@ mod tests {
             assert!(args.iter().any(|arg| arg == required), "missing {required}");
         }
         assert_eq!(args.iter().any(|arg| arg == "-F"), ssh.options().is_some());
+    }
+
+    #[test]
+    fn primary_reconnect_preserves_keepalive_configuration_without_auth_prompts() {
+        let policy = BridgeSshPolicy::for_connection(false, false);
+        assert_eq!(policy, BridgeSshPolicy::PrimaryReconnect);
+        assert!(policy.is_noninteractive());
+        let mut command = Command::new("ssh");
+        policy.apply_options(&mut command);
+        let args = command
+            .get_args()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        for required in [
+            "BatchMode=yes",
+            "NumberOfPasswordPrompts=0",
+            "StrictHostKeyChecking=yes",
+            "ConnectTimeout=10",
+            "ConnectionAttempts=1",
+        ] {
+            assert!(args.iter().any(|arg| arg == required), "missing {required}");
+        }
+        assert!(
+            !args.iter().any(|arg| arg.starts_with("ServerAlive")),
+            "reconnect must not override keepalives from SSH config: {args:?}"
+        );
+    }
+
+    #[test]
+    fn primary_initial_attach_and_saved_bridges_keep_their_ssh_policies() {
+        let initial = BridgeSshPolicy::for_connection(false, true);
+        assert!(!initial.is_noninteractive());
+        let mut command = Command::new("ssh");
+        initial.apply_options(&mut command);
+        assert_eq!(command.get_args().count(), 0);
+
+        for first_connection in [true, false] {
+            let policy = BridgeSshPolicy::for_connection(true, first_connection);
+            assert_eq!(policy, BridgeSshPolicy::SavedEndpoint);
+            assert!(policy.is_noninteractive());
+            let mut command = Command::new("ssh");
+            policy.apply_options(&mut command);
+            let args = command
+                .get_args()
+                .map(|arg| arg.to_string_lossy().into_owned())
+                .collect::<Vec<_>>();
+            for required in [
+                "BatchMode=yes",
+                "StrictHostKeyChecking=yes",
+                "ServerAliveInterval=15",
+                "ServerAliveCountMax=4",
+            ] {
+                assert!(args.iter().any(|arg| arg == required), "missing {required}");
+            }
+        }
     }
 
     #[test]
@@ -6052,6 +6206,50 @@ function Get-Process {
             "--expected-protocol {CURRENT_PROTOCOL} --expected-version {}",
             current_version()
         )));
+    }
+
+    #[test]
+    fn prototype_remote_install_uses_official_base_release() {
+        let channel = crate::build_info::PROTOTYPE_CHANNEL;
+        let version = remote_install_version_for(channel, "1.2.3-proto.custom".to_string());
+        assert_eq!(version, crate::build_info::BASE_VERSION);
+        assert_eq!(remote_install_channel_for(channel), "stable");
+
+        let manifest: RemoteUpdateManifest = serde_json::from_value(serde_json::json!({
+            "version": crate::build_info::BASE_VERSION,
+            "protocol": CURRENT_PROTOCOL,
+            "assets": {"linux-x86_64": {"url": "https://example.com/stable", "sha256": "checksum"}}
+        }))
+        .unwrap();
+        let release = manifest.release_for_version(&version).unwrap();
+        assert_eq!(release.protocol, Some(CURRENT_PROTOCOL));
+        assert_eq!(
+            release.assets["linux-x86_64"].url(),
+            "https://example.com/stable"
+        );
+    }
+
+    #[test]
+    fn nonprototype_remote_install_preserves_build_identity() {
+        for (channel, version) in [
+            ("stable", "1.2.3"),
+            ("preview", "1.2.3-preview.exact-build"),
+            ("custom", "1.2.3-custom.exact-build"),
+        ] {
+            assert_eq!(
+                remote_install_version_for(channel, version.to_string()),
+                version
+            );
+            assert_eq!(remote_install_channel_for(channel), channel);
+        }
+    }
+
+    #[test]
+    fn prototype_build_never_seeds_remote_with_local_binary() {
+        assert!(!local_binary_can_seed_remote_for(
+            &RemotePlatform::local(),
+            crate::build_info::PROTOTYPE_CHANNEL,
+        ));
     }
 
     #[test]

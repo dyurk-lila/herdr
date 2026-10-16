@@ -4128,7 +4128,6 @@ fn install_and_uninstall_letta_preserve_unrelated_settings_and_hooks() {
 #[test]
 fn letta_session_hook_is_silent_and_encodes_default_conversation() {
     use std::io::Write;
-    use std::os::unix::fs::PermissionsExt;
     use std::process::{Command, Stdio};
 
     let _lock = integration_env_lock();
@@ -4140,26 +4139,24 @@ fn letta_session_hook_is_silent_and_encodes_default_conversation() {
     let installed = install_letta().unwrap();
 
     let capture = base.join("args.txt");
-    let fake_herdr = base.join("herdr");
+    // Keep the hook's deadline from measuring cold execution of a temporary script.
+    let fake_pane_command = base.join("pane");
     fs::write(
-        &fake_herdr,
+        &fake_pane_command,
         format!(
             "#!/bin/sh\nprintf '%s\\n' \"$*\" > '{}'\n",
             capture.display()
         ),
     )
     .unwrap();
-    let mut permissions = fs::metadata(&fake_herdr).unwrap().permissions();
-    permissions.set_mode(0o755);
-    fs::set_permissions(&fake_herdr, permissions).unwrap();
-
     let mut child = Command::new("sh")
         .arg(&installed.hook_path)
         .arg("session")
+        .current_dir(&base)
         .env("HERDR_ENV", "1")
         .env("HERDR_PANE_ID", "w1:p2")
         .env("HERDR_SOCKET_PATH", "/tmp/herdr.sock")
-        .env("HERDR_BIN_PATH", &fake_herdr)
+        .env("HERDR_BIN_PATH", "/bin/sh")
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())

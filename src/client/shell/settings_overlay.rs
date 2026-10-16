@@ -182,6 +182,18 @@ pub(super) fn render_settings_overlay(
                 &mut choice_hits,
             );
         }
+        ClientSettingsSection::Typing => {
+            render_choice_section(
+                buffer,
+                content,
+                "predictive remote typing",
+                "show supported edits immediately while waiting for remote echo",
+                &["on", "off"],
+                settings.selected,
+                palette,
+                &mut choice_hits,
+            );
+        }
         ClientSettingsSection::Toast => {
             render_choice_section(
                 buffer,

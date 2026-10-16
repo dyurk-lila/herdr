@@ -13,6 +13,7 @@ pub(crate) enum ClientShellKeybindingSource {
 }
 
 pub(crate) struct ClientShellConfig {
+    pub(super) remote_predict_input: bool,
     pub(super) sidebar_width: u16,
     pub(super) sidebar_min_width: u16,
     pub(super) sidebar_max_width: u16,
@@ -388,6 +389,7 @@ pub(super) enum ClientSettingsSection {
     Sound,
     Toast,
     Integrations,
+    Typing,
 }
 
 impl ClientSettingsSection {
@@ -397,6 +399,7 @@ impl ClientSettingsSection {
         Self::Sound,
         Self::Toast,
         Self::Integrations,
+        Self::Typing,
     ];
 
     pub(super) fn label(self) -> &'static str {
@@ -406,6 +409,7 @@ impl ClientSettingsSection {
             Self::Sound => "sound",
             Self::Toast => "toasts",
             Self::Integrations => "integrations",
+            Self::Typing => "typing",
         }
     }
 }
@@ -859,6 +863,8 @@ pub(super) struct ClientCopyModeState {
 pub(crate) struct ClientShellState {
     pub(super) machine_diagnostics: super::machine_diagnostics::MachineDiagnostics,
     pub(super) config: ClientShellConfig,
+    pub(super) primary_remote: bool,
+    pub(super) input_prediction: super::prediction::InputPrediction,
     pub(super) snapshot: Option<Box<ClientShellSnapshot>>,
     pub(super) active_snapshot_generation: Option<u64>,
     pub(super) pane_surface_generation: Option<u64>,
@@ -1032,6 +1038,8 @@ impl ClientShellState {
         Self {
             machine_diagnostics: Default::default(),
             config,
+            primary_remote: false,
+            input_prediction: super::prediction::InputPrediction::default(),
             snapshot: None,
             active_snapshot_generation: None,
             pane_surface_generation: None,
@@ -1237,6 +1245,7 @@ impl ClientShellState {
     }
 
     pub(super) fn reset_endpoint_projection(&mut self) {
+        self.input_prediction.clear();
         self.hits = ShellHitMap::default();
         self.pane_surface = None;
         self.pending_pane_surface = None;
@@ -1323,6 +1332,7 @@ impl ClientShellState {
         // Screen revisions restart per connection. Keep the displayed surface for selection
         // content comparisons, but retire speculative frames from the old connection.
         if generation_changed {
+            self.input_prediction.clear();
             self.pending_pane_surface = None;
         }
         self.active_snapshot_generation = generation;
@@ -1370,6 +1380,15 @@ impl ClientShellState {
                 .snapshot
                 .as_ref()
                 .is_some_and(|current| current.boot_id != snapshot.boot_id);
+        if self
+            .snapshot
+            .as_ref()
+            .is_some_and(|current| current.focused_pane_id != snapshot.focused_pane_id)
+        {
+            // Focus changes are authoritative even when the intermediate pane surface
+            // is coalesced away before a later snapshot returns to the original pane.
+            self.input_prediction.clear();
+        }
         if boot_changed
             || self
                 .pane_surface
@@ -1804,6 +1823,7 @@ impl ClientShellState {
             .set_scene(std::mem::take(&mut surface.graphics));
         self.pane_surface = Some(surface);
         self.pane_surface_generation = self.active_snapshot_generation;
+        self.reconcile_prediction();
         self.invalidate_link_hover();
         self.resume_mobile_switcher_if_ready();
         self.reconcile_input_source();
@@ -1883,12 +1903,14 @@ impl ClientShellState {
         self.selection_autoscroll_deadline
             .into_iter()
             .chain(self.selection_repaint_deadline)
+            .chain(self.input_prediction.deadline())
             .min()
             .map(|deadline| deadline.saturating_duration_since(now).min(default))
             .unwrap_or(default)
     }
 
     pub(crate) fn invalidate_pane_surface(&mut self) {
+        self.input_prediction.clear();
         self.pane_surface = None;
         self.pending_pane_surface = None;
         self.hits = ShellHitMap::default();

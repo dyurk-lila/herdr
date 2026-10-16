@@ -1542,7 +1542,8 @@ impl ClientShellState {
                         Some(ClientShellOverlay::Settings(ClientSettingsOverlay {
                             section: ClientSettingsSection::Indicators
                                 | ClientSettingsSection::Sound
-                                | ClientSettingsSection::Toast,
+                                | ClientSettingsSection::Toast
+                                | ClientSettingsSection::Typing,
                             ..
                         }))
                     );
@@ -2364,7 +2365,7 @@ impl ClientShellState {
     }
 
     pub(super) fn push_pane_mouse_event(
-        &self,
+        &mut self,
         hit: &PaneHit,
         mouse: MouseEvent,
         modifiers: crossterm::event::KeyModifiers,
@@ -2387,16 +2388,14 @@ impl ClientShellState {
         } else {
             ClientInputTarget::Pane(hit.pane_id.clone())
         };
-        push_target_event(
-            target,
-            ClientPaneInputEvent::Mouse {
-                kind,
-                position,
-                geometry,
-                modifiers: modifiers.bits(),
-                lines: self.config.mouse_scroll_lines.min(u16::MAX as usize) as u16,
-            },
-            outcome,
-        );
+        let event = ClientPaneInputEvent::Mouse {
+            kind,
+            position,
+            geometry,
+            modifiers: modifiers.bits(),
+            lines: self.config.mouse_scroll_lines.min(u16::MAX as usize) as u16,
+        };
+        self.predict_pane_event(&target, &event, outcome);
+        push_target_event(target, event, outcome);
     }
 }

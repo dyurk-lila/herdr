@@ -3,6 +3,7 @@ pub(crate) enum ConfigEdit<'a> {
     Theme(&'a str),
     StatusIndicators(super::StatusIndicatorStyle),
     Sound(bool),
+    RemotePredictInput(bool),
     ToastDelivery(super::ToastDelivery),
 }
 
@@ -12,6 +13,7 @@ impl ConfigEdit<'_> {
             Self::Theme(_) => "theme",
             Self::StatusIndicators(_) => "status indicators",
             Self::Sound(_) => "sound setting",
+            Self::RemotePredictInput(_) => "predictive typing",
             Self::ToastDelivery(_) => "toast setting",
         }
     }
@@ -31,6 +33,9 @@ impl ConfigEdit<'_> {
             ),
             Self::Sound(enabled) => {
                 super::upsert_section_bool(content, "ui.sound", "enabled", enabled)
+            }
+            Self::RemotePredictInput(enabled) => {
+                super::upsert_section_bool(content, "remote", "predict_input", enabled)
             }
             Self::ToastDelivery(delivery) => {
                 let value = match delivery {
@@ -77,6 +82,26 @@ pub(crate) fn write_edit(edit: ConfigEdit<'_>) -> Result<(), String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn predictive_typing_defaults_on_and_edits_preserve_other_settings() {
+        for content in ["", "[remote]\nmanage_ssh_config = false\n"] {
+            let parsed: super::super::Config = toml::from_str(content).unwrap();
+            assert!(parsed.remote.predict_input);
+        }
+        let original =
+            "# personal config\n[remote]\nmanage_ssh_config = false\n[ui.sound]\nenabled = false\n";
+        let mut content = original.to_owned();
+        for enabled in [false, true, false] {
+            content = ConfigEdit::RemotePredictInput(enabled).apply(&content);
+            let parsed: super::super::Config = toml::from_str(&content).unwrap();
+            assert_eq!(parsed.remote.predict_input, enabled);
+            assert!(!parsed.remote.manage_ssh_config);
+            assert!(!parsed.ui.sound.enabled);
+            assert!(content.starts_with("# personal config\n"));
+            assert_eq!(content.matches("predict_input =").count(), 1);
+        }
+    }
 
     #[test]
     fn update_file_at_does_not_move_a_leading_bom_into_the_file() {
